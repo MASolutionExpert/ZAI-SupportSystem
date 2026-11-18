@@ -1,0 +1,39 @@
+# =============================================================================
+# Support Desk — optional reverse-proxy overlay (Caddy 2 + automatic HTTPS)
+#
+# Adds a `caddy` service joined to the SAME default compose network as the
+# `app` service, publishing ports 80/443 and proxying to app:3000 (see
+# deploy/caddy/Caddyfile — edit the domain there before going live).
+#
+# RUN (from the deployment folder / repository root that contains
+# docker-compose.yml):
+#
+#     docker compose -f docker-compose.yml -f deploy/caddy/docker-compose.caddy.yml up -d
+#
+# After editing the Caddyfile, restart the proxy:
+#
+#     docker compose -f docker-compose.yml -f deploy/caddy/docker-compose.caddy.yml restart caddy
+#
+# An nginx alternative is documented in DEPLOYMENT.md. If ports 80/443 are
+# already used by another service on the host, adjust the `ports:` mappings or
+# free them first.
+# =============================================================================
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: supportdesk-caddy
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
