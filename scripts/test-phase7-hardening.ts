@@ -35,6 +35,10 @@ import bcrypt from "bcryptjs";
 const db = new PrismaClient();
 const BASE = "http://localhost:3000";
 const ORIGIN = BASE;
+// Super Admin credentials come from the environment (same contract as the
+// app/bootstrap). Falls back to the documented demo credentials for local use.
+const ADMIN_USER = process.env.SUPERADMIN_USERNAME || "admin";
+const ADMIN_PASS = process.env.SUPERADMIN_PASSWORD || "Admin2026SecureX";
 
 let passCount = 0;
 let failCount = 0;
@@ -161,7 +165,7 @@ async function main() {
   try {
     await headersAndCookies();
     await authGuards();
-    const admin = await login("admin", "Admin2026SecureX");
+    const admin = await login(ADMIN_USER, ADMIN_PASS);
     await csrfTests(admin);
     const operator = await login("operator1", "Operator2026DemoX");
     const fileMgrSession = await login(fileMgrUsername, password);
@@ -216,7 +220,7 @@ async function headersAndCookies() {
   const loginRes = await fetch(`${BASE}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Origin: ORIGIN },
-    body: JSON.stringify({ username: "admin", password: "Admin2026SecureX" }),
+    body: JSON.stringify({ username: ADMIN_USER, password: ADMIN_PASS }),
   });
   const sc = loginRes.headers.get("set-cookie") ?? "";
   check("Session cookie is HttpOnly", /httponly/i.test(sc));
@@ -447,7 +451,7 @@ async function aiGuardrails() {
   const memberDept = departments.find((d) => d.name.includes("عضویت"));
   if (memberDept && aiDept.id !== memberDept.id) {
     const marker = `گلوگاپروتکل${Date.now().toString(36)}`;
-    const adminRow = await db.user.findUnique({ where: { username: "admin" }, select: { id: true } });
+    const adminRow = await db.user.findUnique({ where: { username: ADMIN_USER }, select: { id: true } });
     const tempQa = await db.knowledgeQaEntry.create({
       data: {
         question: `روند ${marker} چیست؟`,
