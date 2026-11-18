@@ -61,7 +61,7 @@ jobs:
 
       - name: Extract image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository }}
           # Semantic version tags from the vX.Y.Z tag: 0.1.0 / 0.1 / 0.
