@@ -58,11 +58,24 @@ async function getRedis(): Promise<RedisClient | null> {
     client.on("ready", () => {
       redisStatus = "ready";
       loggedRedisError = false;
+      // The cache tier must NEVER keep a process alive: CLI scripts (bootstrap,
+      // seed-demo, the verification suites) must exit when their work is done
+      // even though their Redis connection is still open. Unref the socket so
+      // the event loop can drain; long-running servers are unaffected (their
+      // lifetime is held by other handles).
+      (client.stream as { unref?: () => void } | null | undefined)?.unref?.();
       console.log("[cache] Redis connected — shared L2 cache active.");
     });
     client.on("error", (error: unknown) => {
       redisStatus = "error";
       redis = null;
+      // Tear the client down: an open socket or a pending reconnect loop would
+      // keep the event loop (and therefore CLI scripts) alive forever.
+      try {
+        client.disconnect();
+      } catch {
+        // ignore
+      }
       if (!loggedRedisError) {
         loggedRedisError = true;
         console.warn(
@@ -78,8 +91,25 @@ async function getRedis(): Promise<RedisClient | null> {
         const done = () => resolve();
         client.once("ready", done);
         client.once("error", done);
-        setTimeout(done, 3_000).unref?.();
+        const timer = setTimeout(done, 3_000);
+        (timer as { unref?: () => void }).unref?.();
       });
+      if (redisStatus !== "ready") {
+        // Half-open connect (hung socket, unreachable host): kill the client so
+        // no pending reconnect machinery survives; degraded until restart.
+        redisStatus = "error";
+        redis = null;
+        try {
+          client.disconnect();
+        } catch {
+          // ignore
+        }
+        if (!loggedRedisError) {
+          loggedRedisError = true;
+          console.warn("[cache] Redis did not become ready in time — continuing with the in-process L1 cache only.");
+        }
+        return null;
+      }
     }
     return redisStatus === "ready" ? redis : null;
   } catch (error) {
