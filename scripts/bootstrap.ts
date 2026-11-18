@@ -31,6 +31,9 @@ async function main() {
   console.log("✔ Default organizational settings ensured");
 
   await (await import("../src/lib/db")).db.$disconnect();
+  // Close the cache tier explicitly — an open Redis socket would keep this
+  // script alive after the work is done.
+  await (await import("@/lib/cache")).shutdownCache();
 }
 
 main().catch((error) => {

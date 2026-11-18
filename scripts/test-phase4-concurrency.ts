@@ -132,6 +132,9 @@ async function main() {
   console.log("✔ cleanup done");
 
   await db.$disconnect();
+  // Close the cache tier explicitly (an open Redis socket would keep the
+  // event loop alive after the work is done).
+  await (await import("@/lib/cache")).shutdownCache();
   if (!det || unique.size !== ok.length) process.exitCode = 1;
 }
 

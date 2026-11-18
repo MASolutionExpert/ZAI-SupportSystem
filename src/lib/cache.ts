@@ -58,12 +58,6 @@ async function getRedis(): Promise<RedisClient | null> {
     client.on("ready", () => {
       redisStatus = "ready";
       loggedRedisError = false;
-      // The cache tier must NEVER keep a process alive: CLI scripts (bootstrap,
-      // seed-demo, the verification suites) must exit when their work is done
-      // even though their Redis connection is still open. Unref the socket so
-      // the event loop can drain; long-running servers are unaffected (their
-      // lifetime is held by other handles).
-      (client.stream as { unref?: () => void } | null | undefined)?.unref?.();
       console.log("[cache] Redis connected — shared L2 cache active.");
     });
     client.on("error", (error: unknown) => {

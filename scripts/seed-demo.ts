@@ -15,6 +15,7 @@
  * (deterministic demo content — NOT a pipeline bypass for real uploads; real
  * uploads always go through the extraction pipeline).
  */
+import { shutdownCache } from "@/lib/cache";
 import { mkdir, writeFile } from "fs/promises";
 import path from "path";
 
@@ -299,6 +300,9 @@ async function main() {
 
   console.log("✔ Demo data created (departments, operators, knowledge collection, Q&A, document). Remember: this data is demo-only.");
   await db.$disconnect();
+  // The cache tier must be closed explicitly: an open Redis socket would keep
+  // the event loop (and therefore this script) alive after the work is done.
+  await shutdownCache();
 }
 
 /** First existing super admin id (demo rows need a real author FK). */
