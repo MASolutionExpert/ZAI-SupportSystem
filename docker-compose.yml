@@ -1,5 +1,5 @@
 # =============================================================================
-# ZAI Support System — production Docker Compose (v0.10.0)
+# ZAI Support System — production Docker Compose (v0.10.1)
 #
 # Three-container stack:
 #   app   — Next.js standalone server (this repository's image)
@@ -37,7 +37,7 @@
 
 services:
   app:
-    image: ${SUPPORTDESK_IMAGE:-supportdesk:0.10.0}
+    image: ${SUPPORTDESK_IMAGE:-supportdesk:0.10.1}
     # Local build alternative (instead of pulling from a registry):
     # build:
     #   context: .

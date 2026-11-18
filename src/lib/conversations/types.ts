@@ -1,7 +1,7 @@
 /**
  * Conversations — shared domain types and Persian labels (Phase 3).
  *
- * SQLite has no native enums: `Conversation.mode` and
+ * Schema convention: `Conversation.mode` and
  * `ConversationMessage.role` are plain strings validated by these unions at
  * the application layer (mirrors the KB/AI convention).
  */

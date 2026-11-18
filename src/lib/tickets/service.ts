@@ -23,8 +23,9 @@ import {
  * portal, the operator workspace and the chat-handoff linkage.
  *
  * Hard rules (master spec §14 / §6):
- *  - fair distribution runs inside the creation transaction (SQLite
- *    single-writer ⇒ deterministic, concurrency-safe);
+ *  - fair distribution runs inside the creation transaction and the queue
+ *    number is UNIQUE at the database level (deterministic, concurrency-safe
+ *    across processes/instances);
  *  - internal notes NEVER reach customer-facing reads (server-filtered);
  *  - the status machine (TICKET_TRANSITIONS) is enforced for every actor;
  *  - every action is audited; assignment decisions are audited WITH stats;
@@ -39,11 +40,11 @@ const SUBJECT_EXCERPT_CHARS = 60;
 
 /**
  * In-process serialization for assignment-affecting operations (creation,
- * manual assign, transfer). SQLite is single-node/single-process by design
- * (DATABASE.md): serializing at the application layer keeps interactive
- * transactions uncontended (no pool timeouts / SQLITE_BUSY) while the
- * MAX(number)+1 allocation stays deterministic. Multi-node deployments move
- * to PostgreSQL where row locks take over this role.
+ * manual assign, transfer): serializing at the application layer keeps
+ * interactive transactions uncontended (no pool contention) while the
+ * MAX(number)+1 allocation stays deterministic within one process. Across
+ * instances the DB-level UNIQUE constraint on Ticket.number is the safety
+ * net — a racing allocation fails loudly instead of duplicating numbers.
  */
 let assignmentChain: Promise<unknown> = Promise.resolve();
 function withAssignmentLock<T>(fn: () => Promise<T>): Promise<T> {

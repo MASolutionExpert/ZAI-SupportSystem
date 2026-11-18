@@ -2,7 +2,7 @@ import "server-only";
 
 /**
  * Shared File Hub (Phase 5) — types, defaults and limits (master spec §14
- * phase 5 / §8.3 / §10). All status/type fields are String in SQLite and
+ * phase 5 / §8.3 / §10). All status/type fields are String in the schema and
  * validated here with TS unions (schema convention).
  */
 

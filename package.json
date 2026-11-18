@@ -1,6 +1,6 @@
 {
   "name": "supportdesk",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "private": true,
   "scripts": {
     "dev": "bun run db:up && next dev -p 3000 2>&1 | tee dev.log",
@@ -17,7 +17,7 @@
     "db:deploy": "prisma migrate deploy",
     "db:reset": "prisma migrate reset",
     "bootstrap": "bun --conditions=react-server scripts/bootstrap.ts",
-    "seed-demo": "bun scripts/seed-demo.ts",
+    "seed-demo": "bun --conditions=react-server scripts/seed-demo.ts",
     "rag:eval": "bun --conditions=react-server scripts/eval-rag.ts",
     "rag:reingest": "bun --conditions=react-server scripts/reingest-docs.ts"
   },

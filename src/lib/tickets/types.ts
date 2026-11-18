@@ -1,7 +1,7 @@
 /**
  * Tickets — shared domain types and Persian labels (Phase 4).
  *
- * SQLite has no native enums: status/createdVia/assignmentMode are plain
+ * Schema convention: status/createdVia/assignmentMode are plain
  * strings validated by these unions at the application layer.
  */
 

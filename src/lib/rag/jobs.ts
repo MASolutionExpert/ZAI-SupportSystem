@@ -76,7 +76,8 @@ let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
  * Claim + execute due jobs until the queue drains. Safe to call concurrently
- * (module-level guard serializes within the process; SQLite serializes across).
+ * and across instances (module-level guard serializes within the process;
+ * the claim itself is an atomic conditional UPDATE — first claimant wins).
  */
 export async function runDueJobs(): Promise<number> {
   let processed = 0;

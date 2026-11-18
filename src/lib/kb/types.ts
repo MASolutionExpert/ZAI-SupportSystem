@@ -1,10 +1,11 @@
 /**
  * Knowledge Base — shared domain types, status unions and Persian labels.
  *
- * SQLite has no native enums: every status is a plain string validated by
- * these TS unions (plus Zod schemas in kb/validators) at the application
- * layer. JSON payloads (keywords, retrieval sources) are stored as
- * JSON-serialized strings in String columns.
+ * Schema convention: status/type fields are plain strings validated by these
+ * TS unions (plus Zod schemas in kb/validators) at the application layer —
+ * keeps the migration history stable and values enumerable in code. JSON
+ * payloads (keywords, retrieval sources) are stored as JSON-serialized
+ * strings in String columns.
  */
 
 // ------------------------------------------------------------------ documents

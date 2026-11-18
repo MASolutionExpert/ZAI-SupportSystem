@@ -11,8 +11,9 @@ import { chunkToEvidence } from "./evidence";
  * RAG Engine — semantic (vector) retriever behind the `VectorIndex` seam
  * (task §4.B).
  *
- * SQLiteJsonVectorIndex: embeddings live as JSON columns on authorized chunks;
- * cosine similarity runs in-process over the scoped candidate set. The same
+ * In-process JSON vector index: embeddings live as JSON columns on authorized
+ * chunks (PostgreSQL String columns — no pgvector dependency); cosine
+ * similarity runs in-process over the scoped candidate set. The same
  * interface accepts a PostgreSQL + pgvector implementation later without any
  * change to retrieval logic (docs/RAG-ENGINE.md §5.2).
  *
