@@ -73,7 +73,7 @@ jobs:
           fi
 
       - name: Checkout (read VERSION for the default tag)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Resolve image tag
         id: tag
