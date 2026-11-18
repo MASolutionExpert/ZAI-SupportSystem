@@ -1,16 +1,28 @@
 # =============================================================================
-# Support Desk — production Docker Compose
+# ZAI Support System — production Docker Compose (v0.10.0)
 #
-# DESIGN DECISION — no database service (single-node, self-hosted):
-#   * Phase 1 uses SQLite, stored on the named volume `supportdesk_db` mounted
-#     at /app/db (DATABASE_URL=file:/app/db/supportdesk.db). There is NO
-#     separate PostgreSQL service; the Prisma schema is provider-portable to
-#     PostgreSQL in a later phase without model changes — see DATABASE.md.
-#   * Uploaded/persistent files live on the named volume `supportdesk_storage`
-#     mounted at /app/storage (STORAGE_DIR=/app/storage).
+# Three-container stack:
+#   app   — Next.js standalone server (this repository's image)
+#   db    — PostgreSQL 16 (Prisma ORM data layer)
+#   cache — Redis 7 (shared cache layer, optional but enabled by default)
+#
+# DATA SAFETY — redeploys, updates and CLI operations NEVER touch data:
+#   * Database lives on the named volume `supportdesk_pgdata`
+#     (PostgreSQL data directory).
+#   * Uploaded/persistent files live on `supportdesk_storage`
+#     (STORAGE_DIR=/app/storage inside the app container).
+#   * Redis persistence (AOF) lives on `supportdesk_redis`; losing it is
+#     harmless — the cache is recomputed from the database.
+#   * `docker compose up -d` after an image change only recreates the app
+#     container; `db` and `cache` keep running with their volumes.
+#
+# DATABASE URL WIRING:
+#   Compose builds DATABASE_URL for the app from POSTGRES_* variables in .env
+#   — the .env file NEVER needs a DATABASE_URL entry. This keeps credentials
+#   in exactly one place and makes `docker compose` deployments self-healing.
 #
 # IMAGE — pin an explicit version, NEVER :latest in production:
-#   Set in .env:  SUPPORTDESK_IMAGE=ghcr.io/<org>/<repo>:0.1.0
+#   Set in .env:  SUPPORTDESK_IMAGE=ghcr.io/<org>/<repo>:0.10.0
 #   The registry/mirror is configurable at deploy time via SUPPORTDESK_IMAGE.
 #   For a local build instead of a registry pull, uncomment the `build:` block
 #   below and run `docker compose build`.
@@ -25,18 +37,27 @@
 
 services:
   app:
-    image: ${SUPPORTDESK_IMAGE:-supportdesk:0.1.0}
+    image: ${SUPPORTDESK_IMAGE:-supportdesk:0.10.0}
     # Local build alternative (instead of pulling from a registry):
     # build:
     #   context: .
     #   dockerfile: Dockerfile
     container_name: supportdesk-app
     env_file: .env
+    environment:
+      # Compose-managed wiring — always consistent with the db/cache services
+      # below (overrides any hand-edited value in .env on purpose).
+      DATABASE_URL: postgresql://${POSTGRES_USER:-supportdesk}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in .env (supportdesk install generates it)}@db:5432/${POSTGRES_DB:-supportdesk}?schema=public
+      REDIS_URL: redis://cache:6379
     ports:
       - "${APP_PORT:-3000}:3000"
     volumes:
-      - supportdesk_db:/app/db
       - supportdesk_storage:/app/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
     restart: unless-stopped
     stop_grace_period: 30s
     healthcheck:
@@ -52,9 +73,46 @@ services:
       retries: 5
       start_period: 20s
 
+  db:
+    image: postgres:16-alpine
+    container_name: supportdesk-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-supportdesk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in .env (supportdesk install generates it)}
+      POSTGRES_DB: ${POSTGRES_DB:-supportdesk}
+    volumes:
+      - supportdesk_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-supportdesk} -d ${POSTGRES_DB:-supportdesk}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  cache:
+    image: redis:7-alpine
+    container_name: supportdesk-cache
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - supportdesk_redis:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 # Persistent data volumes — survive rebuilds, upgrades and restarts.
-# They are pre-created inside the image as uid-1000 (user "node") directories,
-# so first use inherits safe ownership.
 volumes:
-  supportdesk_db:
+  supportdesk_pgdata:
+  supportdesk_redis:
   supportdesk_storage:

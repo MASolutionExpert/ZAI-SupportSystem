@@ -429,7 +429,7 @@ export async function listCitizensForAdmin(opts?: {
   const pageSize = Math.max(1, Math.min(100, Math.floor(opts?.pageSize ?? 20)));
 
   const query = (opts?.query ?? "").trim();
-  let where: { status?: string; nationalIdHmac?: string; fullName?: { contains: string } } = {};
+  let where: { status?: string; nationalIdHmac?: string; fullName?: { contains: string; mode: "insensitive" } } = {};
   if (opts?.status && (CITIZEN_STATUSES as readonly string[]).includes(opts.status)) {
     where.status = opts.status;
   }
@@ -440,7 +440,7 @@ export async function listCitizensForAdmin(opts?: {
     if (normalized) {
       where = { ...where, nationalIdHmac: nationalIdHmac(normalized) };
     } else {
-      where = { ...where, fullName: { contains: query } };
+      where = { ...where, fullName: { contains: query, mode: "insensitive" } };
     }
   }
 

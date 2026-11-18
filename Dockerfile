@@ -13,9 +13,11 @@
 #              against exactly those versions (so the runtime node_modules is
 #              self-consistent, including Prisma engine binaries).
 #  runtime   : node:22-bookworm-slim, non-root user "node", openssl + tini
-#              only, named-volume data dirs pre-created with safe ownership,
+#              only, persistent storage dir pre-created with safe ownership,
 #              standalone server (node server.js), HEALTHCHECK via node's
-#              built-in fetch against /api/health.
+#              built-in fetch against /api/health. The database and cache run
+#              as separate containers (docker-compose.yml: postgres:16 +
+#              redis:7) — this image is stateless except for /app/storage.
 #
 #  Security posture:
 #   - runs as non-root (uid 1000), no privileged mode, no Docker socket
@@ -90,10 +92,10 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
-# Pre-create the persistent data directories owned by uid 1000 ("node") so
-# that named Docker volumes inherit safe ownership when first mounted.
-RUN mkdir -p /app/db /app/storage \
-    && chown -R node:node /app/db /app/storage
+# Pre-create the persistent storage directory owned by uid 1000 ("node") so
+# that the named Docker volume inherits safe ownership when first mounted.
+# The database is a separate container (postgres:16) with its own volume.
+RUN mkdir -p /app/storage && chown -R node:node /app/storage
 
 # Production dependency tree (includes the generated Prisma client/engines).
 # Copied AFTER the standalone bundle below so the full, self-consistent
@@ -123,8 +125,9 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
     CMD ["node", "-e", "fetch('http://127.0.0.1:3000/api/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
 
-# Entrypoint: optional `prisma migrate deploy` (MIGRATE_ON_STARTUP), then it
-# execs the default CMD below. Override CMD to run a different command.
+# Entrypoint: waits for PostgreSQL, then optional `prisma migrate deploy`
+# (MIGRATE_ON_STARTUP), then execs the default CMD below. Override CMD to run
+# a different command.
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/scripts/docker-entrypoint.sh"]
 
 # Production server: the standalone Next.js server (official production

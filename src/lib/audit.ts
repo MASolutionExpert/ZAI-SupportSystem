@@ -106,9 +106,9 @@ export async function listAuditPage(query: AuditPageQuery = {}): Promise<AuditPa
   const pageSize = Math.min(Math.max(1, Math.floor(query.pageSize ?? 25)), 100);
 
   const where = {
-    ...(query.action ? { action: { contains: query.action } } : {}),
+    ...(query.action ? { action: { contains: query.action, mode: "insensitive" as const } } : {}),
     ...(query.actorType ? { actorType: query.actorType } : {}),
-    ...(query.actorLabel ? { actorLabel: { contains: query.actorLabel } } : {}),
+    ...(query.actorLabel ? { actorLabel: { contains: query.actorLabel, mode: "insensitive" as const } } : {}),
     ...(query.entityType ? { entityType: query.entityType } : {}),
     ...(query.entityId ? { entityId: query.entityId } : {}),
     ...(query.from || query.to

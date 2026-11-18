@@ -8,8 +8,10 @@
 #   3. clones this repository into a deployment folder (or reuses one),
 #   4. delegates to scripts/supportdesk.sh install — which interactively asks
 #      for the Super Admin username/password and the public URL, generates
-#      cryptographic secrets, pulls the pinned image, starts the stack and
-#      waits for the health endpoint.
+#      cryptographic secrets (APP secrets + the PostgreSQL password), pulls
+#      the pinned image, starts the three-container stack (app + PostgreSQL
+#      + Redis) and waits for the health endpoint. Data lives in named
+#      Docker volumes: redeploys, updates and CLI operations never touch it.
 #
 # One-liner (interactive, recommended):
 #

@@ -23,9 +23,6 @@ export type LoginResult =
   | { ok: true; mustChangePassword: boolean; user: { id: string; username: string; name: string; roleKey: string } }
   | { ok: false; error: string; retryAfterSeconds?: number };
 
-const GLOBAL_LOGIN_WINDOW_MS = 60_000;
-const GLOBAL_LOGIN_LIMIT = 10;
-
 export async function login(
   username: string,
   password: string,
@@ -34,9 +31,11 @@ export async function login(
   const env = getEnv();
 
   // Per-IP throttle — protects against credential stuffing bursts.
+  // Tunable via LOGIN_IP_LIMIT / LOGIN_IP_WINDOW_SECONDS (defaults: 10 / 60 s);
+  // CI and the verification suites raise the limit — see env.ts.
   const ipLimited = rateLimit(`login:ip:${meta.ip ?? "unknown"}`, {
-    limit: GLOBAL_LOGIN_LIMIT,
-    windowMs: GLOBAL_LOGIN_WINDOW_MS,
+    limit: env.LOGIN_IP_LIMIT,
+    windowMs: env.LOGIN_IP_WINDOW_SECONDS * 1_000,
   });
   if (!ipLimited.allowed) {
     return {

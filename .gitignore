@@ -56,6 +56,7 @@ server.log
 # Support Desk runtime data (never commit secrets or data)
 /db/*.db
 /db/*.db-journal
+/db/pgdata/
 /storage/
 /tool-results/
 /upload/

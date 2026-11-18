@@ -69,8 +69,8 @@ export type EligibleOperator = {
 /**
  * Candidate discovery — deliberately OUTSIDE any write transaction: it uses
  * the global client (cached permission checks, read-only queries). Only the
- * fast load-counting runs inside the transaction, keeping the SQLite write
- * lock hold time minimal (concurrency-safety, spec §14).
+ * fast load-counting runs inside the transaction, keeping the row-lock hold
+ * time minimal (concurrency-safety, spec §14).
  */
 export async function computeEligibleOperators(
   departmentId: string

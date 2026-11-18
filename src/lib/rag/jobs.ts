@@ -5,10 +5,11 @@ import "server-only";
  *
  * Long-running document operations (re-indexing, bulk re-embedding after an
  * embedding-model change) run through this queue instead of blocking API
- * requests. Deliberately simple: one in-process runner polling PENDING rows
- * (SQLite's single connection makes the claim race-free), attempts with
- * exponential backoff, explicit FAILED terminal state with lastError. No new
- * infrastructure — the queue survives restarts because state is in the DB.
+ * requests. Deliberately simple: one in-process runner polling PENDING rows;
+ * claims use a conditional updateMany compare-and-set (idempotent and race-
+ * safe on PostgreSQL row locking), attempts with exponential backoff,
+ * explicit FAILED terminal state with lastError. No new infrastructure —
+ * the queue survives restarts because state is in the DB.
  */
 
 import { db } from "@/lib/db";

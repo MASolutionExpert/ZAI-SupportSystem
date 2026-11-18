@@ -282,8 +282,10 @@ async function createTicketCore(
   const eligible = await computeEligibleOperators(department.id);
 
   // Retry loop for the unique ticket number under concurrent creation
-  // (SQLite serializes writers; P2002 collisions and lock-contention
-  // timeouts P2028/P1008 are retried with jittered backoff).
+  // (PostgreSQL: parallel transactions can read the same MAX before either
+  // commits; the unique constraint turns the loser into P2002, and lock-
+  // contention/serialization timeouts P2028/P1008 are retried with jittered
+  // backoff).
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 4; attempt++) {
     if (attempt > 0) {
@@ -600,9 +602,9 @@ export async function listTickets(
     ...(opts?.q
       ? {
           OR: [
-            { subject: { contains: opts.q } },
-            { customer: { fullName: { contains: opts.q } } },
-            { messages: { some: { content: { contains: opts.q } } } },
+            { subject: { contains: opts.q, mode: "insensitive" as const } },
+            { customer: { fullName: { contains: opts.q, mode: "insensitive" as const } } },
+            { messages: { some: { content: { contains: opts.q, mode: "insensitive" as const } } } },
             ...( /^\d{1,9}$/.test(opts.q) ? [{ number: Number(opts.q) }] : []),
           ],
         }

@@ -17,7 +17,15 @@
 
 A production-grade organizational support platform: a **public customer support portal**, an **operator helpdesk** with a concurrency-safe ticket engine, a **shared file hub** with fail-closed upload security, a **super-admin control panel**, and a **grounded AI assistant (RAG)** that answers strictly from an organization-managed knowledge base — with abstention and human escalation when the knowledge base is insufficient.
 
-Built as a modular monolith on **Next.js 16 (App Router) + TypeScript + Prisma/SQLite + Tailwind 4 + shadcn/ui**, deployed as a **single Docker container** (or any Node 22 host), fronted by an optional **Caddy** reverse proxy for automatic HTTPS.
+Built as a modular monolith on **Next.js 16 (App Router) + TypeScript + Prisma/PostgreSQL + Tailwind 4 + shadcn/ui**, deployed as a **Dockerized three-container stack** (app + PostgreSQL 16 + Redis 7 — data and media live in named volumes, so redeploys, updates and CLI operations never touch them), fronted by an optional **Caddy** reverse proxy for automatic HTTPS.
+
+```
+                       ┌───────────────────── docker compose ────────────────────┐
+  users ──► Caddy ──►  │  app (Next.js, :3000)                                   │
+                       │    ├── DATABASE_URL ──►  db  (postgres:16, volume pgdata)   \
+                       │    └── REDIS_URL ─────►  cache (redis:7, AOF, volume)      \
+                       └──────────────────────────────────────────────────────────┘
+```
 
 | Workspace | Highlights |
 |---|---|
@@ -95,7 +103,8 @@ bash install-zai.sh --non-interactive
 
 Generated automatically (never typed, never printed):
 
-- `AUTH_SECRET` (session integrity) and `APP_ENCRYPTION_KEY` (customer national-ID encryption) — OpenSSL CSPRNG, `.env` written with `600` permissions;
+- `AUTH_SECRET` (session integrity), `APP_ENCRYPTION_KEY` (customer national-ID encryption) and `POSTGRES_PASSWORD` (database superuser of the stack) — OpenSSL CSPRNG, `.env` written with `600` permissions;
+- `DATABASE_URL` is **built by docker compose** from the `POSTGRES_*` variables — the database, cache and storage wiring is always consistent with the three containers;
 - `SUPPORTDESK_IMAGE` pinned to `ghcr.io/miladalefbusiness/zai-supportsystem:<version>` — **explicit versions, never `:latest`**.
 
 Afterwards: `./scripts/supportdesk.sh status | logs | version` — وضعیت، لاگ‌ها و نسخهٔ سامانه.
@@ -113,7 +122,8 @@ All variables live in `.env` (created by the installer, documented inline in [.e
 
 | Variable | Purpose |
 |---|---|
-| `DATABASE_URL` | SQLite file location (named volume `/app/db` in Docker) |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Database credentials (password generated; compose builds `DATABASE_URL` from these) |
+| `REDIS_URL` | Shared cache (compose injects `redis://cache:6379`; unset/absent → in-process fallback) |
 | `AUTH_SECRET` | Session-token integrity secret (generated) |
 | `APP_ENCRYPTION_KEY` | AES-256-GCM key for national-ID encryption + HMAC index (generated) |
 | `SUPERADMIN_USERNAME` / `SUPERADMIN_PASSWORD` | First-bootstrap Super Admin (created only if missing) |
@@ -122,6 +132,7 @@ All variables live in `.env` (created by the installer, documented inline in [.e
 | `APP_TRUSTED_ORIGINS` | Extra hosts accepted by the CSRF origin check (suffix rules allowed: `.example.com`) |
 | `STORAGE_DIR` | Uploaded files root (named volume `/app/storage` in Docker) |
 | `SESSION_TTL_HOURS`, `LOGIN_MAX_ATTEMPTS`, `LOGIN_LOCK_MINUTES` | Session lifetime, brute-force throttling/lockout |
+| `LOGIN_IP_LIMIT`, `LOGIN_IP_WINDOW_SECONDS` | Per-IP login throttle window (default 10 / 60 s) |
 | `FORCE_SECURE_COOKIES` | Force `Secure` cookies (auto-detects HTTPS behind a proxy when empty) |
 | `MIGRATE_ON_STARTUP` | Run pending Prisma migrations on container start (default `true`) |
 | `SUPPORTDESK_IMAGE`, `APP_PORT` | Deployment-only: pinned image reference, published host port |
@@ -199,7 +210,7 @@ Three independent layers (see [BACKUP-RESTORE.md](BACKUP-RESTORE.md) for the ful
 ## Backup & restore
 
 ```bash
-./scripts/supportdesk.sh backup            # consistent archive: DB + storage + .env (brief downtime)
+./scripts/supportdesk.sh backup            # consistent archive: pg_dump snapshot + storage + .env (online, no downtime)
 ./scripts/supportdesk.sh restore <file>    # DESTRUCTIVE — replaces current data (asks YES)
 ```
 
@@ -238,22 +249,34 @@ Report vulnerabilities privately — do not open public issues for security prob
 
 ## Development
 
-Prerequisites: [Bun](https://bun.sh) 1.x. SQLite — no external services.
+Prerequisites: [Bun](https://bun.sh) 1.x. PostgreSQL is provided locally via `embedded-postgres` (official PG binaries, no Docker needed — data lives in `db/pgdata/`, gitignored):
 
 ```bash
 bun install
 cp .env.example .env
+# point DATABASE_URL at the local instance (see .env.example note):
+#   DATABASE_URL=postgresql://supportdesk:supportdesk@127.0.0.1:5433/supportdesk?schema=public
+bun run db:up                 # boot local PostgreSQL (idempotent; db:down stops it)
 bunx prisma migrate deploy
-bun run dev                    # http://localhost:3000 (logs -> dev.log)
+bun run bootstrap             # roles/permissions + Super Admin (env credentials)
+bun run dev                    # http://localhost:3000 (logs -> dev.log; auto-starts db:up)
 ```
+
+Optional demo content (departments, operators, KB, RAG eval baseline):
+
+```bash
+bun run seed-demo
+```
+
+The shared cache layer works without Redis locally (in-process fallback). To exercise the real Redis tier, point `REDIS_URL` at any reachable Redis 7 instance — `GET /api/health` reports `checks.cache: "redis"` when connected.
 
 ```bash
 bun run lint                   # eslint
 bun run typecheck              # tsc --noEmit
-bun scripts/test-phase4-concurrency.ts   # DB-level (dev server not needed)
-bun scripts/test-phase5-security.ts
-bun scripts/test-phase6-security.ts      # needs dev server on :3000
-bun scripts/test-phase7-hardening.ts
+bun --conditions=react-server scripts/test-phase4-concurrency.ts   # DB-level (dev server not needed)
+bun --conditions=react-server scripts/test-phase5-security.ts      # needs dev server on :3000
+bun --conditions=react-server scripts/test-phase6-security.ts      # needs dev server on :3000
+bun --conditions=react-server scripts/test-phase7-hardening.ts     # needs dev server on :3000
 ```
 
 In development, missing `AUTH_SECRET` / `SUPERADMIN_PASSWORD` fall back to deterministic dev values (with a loud warning). Production refuses to start without them. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow (branches, conventional commits, release process).
@@ -295,7 +318,7 @@ In development, missing `AUTH_SECRET` / `SUPERADMIN_PASSWORD` fall back to deter
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Modular monolith layout, layers, modules, request flows |
 | [SECURITY.md](SECURITY.md) | Threat model, implemented controls, credential recovery |
 | [PERMISSIONS.md](PERMISSIONS.md) | Permission catalog, role matrix, effective-permission algorithm |
-| [DATABASE.md](DATABASE.md) | Schema reference, migration workflow, SQLite→PostgreSQL runbook |
+| [DATABASE.md](DATABASE.md) | PostgreSQL schema reference, migration workflow, data-model conventions |
 | [AI-ARCHITECTURE.md](AI-ARCHITECTURE.md) | RAG pipeline, provider adapter, corrective loop, evaluation |
 | [KNOWLEDGE-BASE.md](KNOWLEDGE-BASE.md) | Collections, document pipeline, Q&A editor, retrieval semantics |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Deployment guide (Docker, Caddy, bare-metal) |

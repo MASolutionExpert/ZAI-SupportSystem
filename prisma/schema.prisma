@@ -1,14 +1,16 @@
 // ============================================================================
 // Support Desk — Organizational AI Support Desk & File Hub
-// Phase 1 Foundation Schema (Prisma + SQLite v1; provider is portable to
-// PostgreSQL later without model changes — see DATABASE.md)
+// Data layer: PostgreSQL (Prisma ORM).
+//  - v0.9.x and earlier shipped on SQLite; v0.10.0 re-baselined onto
+//    PostgreSQL (single init migration, see prisma/migrations + DATABASE.md).
 //
 // Conventions:
-//  - SQLite has no native enums/JSON in Prisma: status/type fields are String
-//    validated at the application layer (Zod + TS unions), JSON payloads are
-//    stored as serialized strings in clearly-named fields.
-//  - Customer national IDs are NEVER stored as relational keys (Phase 4 will
-//    use app-level encryption + keyed HMAC lookup, see SECURITY.md).
+//  - Status/type fields are String validated at the application layer
+//    (Zod + TS unions) rather than PG enums — keeps migration history stable
+//    and values enumerable in code; JSON payloads are stored as serialized
+//    strings in clearly-named fields (parser helpers centralize access).
+//  - Customer national IDs are NEVER stored as relational keys (app-level
+//    encryption + keyed HMAC lookup, see SECURITY.md).
 //  - All changes go through version-controlled migrations (prisma/migrations).
 // ============================================================================
 
@@ -17,7 +19,7 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 

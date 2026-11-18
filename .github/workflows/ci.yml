@@ -6,7 +6,8 @@
 #   typecheck  tsc --noEmit
 #   build      next build (standalone artifact) with dummy configuration
 #   tests      the four mandated verification suites (phases 4-7) executed
-#              against a live dev server on a fresh migrated database:
+#              against a live dev server on a REAL PostgreSQL database
+#              (service containers mirror the production stack):
 #                phase 4  concurrent ticket creation & fair-distribution
 #                phase 5  file-hub fail-closed security
 #                phase 6  super-admin permission matrix & audit trail
@@ -71,8 +72,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      # Dummy values so the pipeline never needs real secrets.
-      DATABASE_URL: file:../db/ci.db  # relative paths resolve against prisma/, so ../db = repo/db
+      # Dummy values so the pipeline never needs real secrets. The build never
+      # opens a connection — the URL only has to satisfy env validation.
+      DATABASE_URL: postgresql://ci:ci-dummy-password@localhost:5432/ci_dummy?schema=public
       AUTH_SECRET: dummy-secret-dummy-secret-dummy-secret-1234
       SUPERADMIN_USERNAME: ci-admin
       SUPERADMIN_PASSWORD: ci-dummy-Passw0rd-123
@@ -104,14 +106,45 @@ jobs:
     name: tests (phase 4-7)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
+    # Service containers mirror the production stack (docker-compose.yml):
+    # PostgreSQL data layer + Redis shared cache.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: supportdesk
+          POSTGRES_PASSWORD: ci-postgres-password
+          POSTGRES_DB: supportdesk_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U supportdesk -d supportdesk_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
     env:
-      DATABASE_URL: file:../db/ci.db
+      DATABASE_URL: postgresql://supportdesk:ci-postgres-password@localhost:5432/supportdesk_test?schema=public
+      REDIS_URL: redis://127.0.0.1:6379
       AUTH_SECRET: dummy-secret-dummy-secret-dummy-secret-1234
       APP_ENCRYPTION_KEY: dummy-encryption-key-dummy-encryption-key-1234=
       SUPERADMIN_USERNAME: ci-admin
       SUPERADMIN_PASSWORD: ci-dummy-Passw0rd-123
       BOOTSTRAP_ON_STARTUP: "true"
       APP_URL: http://127.0.0.1:3000
+      # The suites fire >10 consecutive logins from 127.0.0.1; raise the per-IP
+      # guard so suites don't trip it (account lockout itself stays exercised).
+      LOGIN_IP_LIMIT: "200"
       NEXT_TELEMETRY_DISABLED: "1"
     steps:
       - name: Checkout

@@ -14,7 +14,9 @@ const nextConfig: NextConfig = {
   // mammoth must stay outside the server bundle (KB text extraction).
   serverExternalPackages: ["pdf-parse", "mammoth"],
   // Development-only: allow the sandbox/browser origin for HMR assets.
-  allowedDevOrigins: ["127.0.0.1", "localhost"],
+  // "*.space-z.ai" covers the IM-gateway preview origins, whose Host header is
+  // rewritten by the external relay (browser Origin !== local Host otherwise).
+  allowedDevOrigins: ["127.0.0.1", "localhost", "*.space-z.ai"],
   typescript: {
     ignoreBuildErrors: true,
   },

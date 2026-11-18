@@ -17,8 +17,8 @@
 #   rollback           Switch back to the image recorded by the last 'update'
 #                      (health-gated; DB schema is NOT downgraded — restore a
 #                      backup if migrations are incompatible).
-#   backup             Consistent backup archive (DB + storage + .env) under
-#                      ./backups — brief downtime while the app is stopped.
+#   backup             Consistent online backup archive (pg_dump database
+#                      snapshot + storage + .env) under ./backups — NO downtime.
 #   restore <file>     DESTRUCTIVE! Restore DB, storage and .env from a backup.
 #   status             Compose status, health endpoint output, volume usage.
 #   logs [n]           Show the last n log lines (default 200).
@@ -147,11 +147,11 @@ container_exists() {
 container_running() {
   [ "$(docker inspect -f '{{.State.Running}}' "$APP_CONTAINER" 2>/dev/null || true)" = "true" ]
 }
-volume_for() {  # volume_for /app/db -> real (project-prefixed) volume name
+volume_for() {  # volume_for DEST -> real (project-prefixed) volume name
   local dest="$1" logical vol
   case "$dest" in
-    /app/db)       logical="supportdesk_db" ;;
-    /app/storage)  logical="supportdesk_storage" ;;
+    /var/lib/postgresql/data)  logical="supportdesk_pgdata" ;;
+    /app/storage)              logical="supportdesk_storage" ;;
     *) return 0 ;;
   esac
   vol="$(docker inspect -f \
@@ -295,7 +295,7 @@ cmd_install() {
   if [ -f "$ENV_FILE" ]; then
     warn ".env already exists — KEEPING it (install never overwrites existing configuration or data)."
     local key missing=0
-    for key in DATABASE_URL AUTH_SECRET SUPERADMIN_USERNAME SUPERADMIN_PASSWORD; do
+    for key in POSTGRES_PASSWORD AUTH_SECRET SUPERADMIN_USERNAME SUPERADMIN_PASSWORD; do
       if ! grep -qE "^${key}=" "$ENV_FILE"; then
         err "Missing required key in existing .env: ${key}"
         missing=1
@@ -329,17 +329,20 @@ cmd_install() {
       SA_APP_URL="${APP_URL:-}"
       GEN_AUTH_SECRET="$(openssl rand -base64 48)"
       GEN_ENC_KEY="$(openssl rand -base64 32)"
+      GEN_PG_PASSWORD="$(openssl rand -hex 24)"
       info "Headless mode — credentials read from the environment (SUPERADMIN_USERNAME=${SA_USERNAME})."
     else
-      info "Creating .env from .env.example — AUTH_SECRET / APP_ENCRYPTION_KEY are generated with openssl."
+      info "Creating .env from .env.example — AUTH_SECRET / APP_ENCRYPTION_KEY / POSTGRES_PASSWORD are generated with openssl."
       GEN_AUTH_SECRET="$(openssl rand -base64 48)"
       GEN_ENC_KEY="$(openssl rand -base64 32)"
+      GEN_PG_PASSWORD="$(openssl rand -hex 24)"
       prompt_superadmin_username
       prompt_superadmin_password
       prompt_app_url
     fi
     {
-      grep -vE '^(AUTH_SECRET|APP_ENCRYPTION_KEY|SUPERADMIN_USERNAME|SUPERADMIN_PASSWORD|APP_URL)=' "$ENV_EXAMPLE"
+      grep -vE '^(AUTH_SECRET|APP_ENCRYPTION_KEY|POSTGRES_PASSWORD|SUPERADMIN_USERNAME|SUPERADMIN_PASSWORD|APP_URL)=' "$ENV_EXAMPLE"
+      printf 'POSTGRES_PASSWORD=%s\n' "$GEN_PG_PASSWORD"
       printf 'AUTH_SECRET=%s\n' "$GEN_AUTH_SECRET"
       printf 'APP_ENCRYPTION_KEY=%s\n' "$GEN_ENC_KEY"
       printf 'SUPERADMIN_USERNAME=%s\n' "$SA_USERNAME"
@@ -347,7 +350,7 @@ cmd_install() {
       printf 'APP_URL=%s\n' "$SA_APP_URL"
     } > "$ENV_FILE"
     chmod 600 "$ENV_FILE"
-    ok ".env created (permissions 600). NEVER commit this file to git."
+    ok ".env created (permissions 600) — DATABASE_URL is built by docker compose from the POSTGRES_* variables. NEVER commit this file to git."
   fi
 
   # --- 1b. Default registry image (published by the Release workflow) ---------
@@ -359,8 +362,8 @@ cmd_install() {
   fi
 
   # --- 2. Persistent directories (DB + files live in named Docker volumes) ---
-  mkdir -p "$BACKUP_DIR" "$DEPLOY_DIR/db" "$DEPLOY_DIR/storage"
-  info "Database and uploaded files persist in named Docker volumes (supportdesk_db, supportdesk_storage); ./backups holds backup archives."
+  mkdir -p "$BACKUP_DIR" "$DEPLOY_DIR/storage"
+  info "PostgreSQL, Redis and uploaded files persist in named Docker volumes (supportdesk_pgdata, supportdesk_redis, supportdesk_storage) — redeploys and updates never touch them; ./backups holds backup archives."
 
   # --- 3. Image resolution & pull (respect SUPPORTDESK_IMAGE) ---
   local image
@@ -401,7 +404,7 @@ cmd_install() {
 }
 
 # =============================================================================
-# Command: backup  (brief downtime: app is stopped for a consistent SQLite copy)
+# Command: backup  (ONLINE — pg_dump custom-format snapshot, no downtime)
 # =============================================================================
 cmd_backup() {
   banner
@@ -409,47 +412,26 @@ cmd_backup() {
   require_compose
   require_env_file
 
-  local stamp backup_path staging was_running=false db_vol stor_vol image
+  local stamp backup_path staging pg_user pg_db
   stamp="$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$BACKUP_DIR"
   backup_path="$BACKUP_DIR/supportdesk-backup-${stamp}.tar.gz"
   staging="$(mktemp -d "${BACKUP_DIR}/.staging-${stamp}.XXXXXX")"
-  mkdir -p "${staging}/db"
 
-  image="$(get_image)"
-  if ! docker image inspect "$image" >/dev/null 2>&1; then
-    err "Image '${image}' is not present locally — start the app once (install) before backing up."
+  # The backup runs against the db service (postgres:16-alpine, matching
+  # engine version). It must be running for a consistent snapshot.
+  if [ "$(docker compose ps -q db | xargs -r docker inspect -f '{{.State.Running}}' 2>/dev/null || true)" != "true" ]; then
+    err "The database container is not running — start the stack first (docker compose up -d)."
     rm -rf "$staging"
     exit 1
   fi
 
-  db_vol="$(volume_for /app/db)"
-  stor_vol="$(volume_for /app/storage)"
-  if [ -z "$db_vol" ]; then
-    err "Could not resolve the database volume — has the app been started at least once (docker compose up -d)?"
-    rm -rf "$staging"
-    exit 1
-  fi
-  if [ -z "$stor_vol" ]; then
-    err "Could not resolve the storage volume."
-    rm -rf "$staging"
-    exit 1
-  fi
+  pg_user="$(env_value POSTGRES_USER)"
+  pg_db="$(env_value POSTGRES_DB)"
+  [ -n "$pg_user" ] || pg_user="supportdesk"
+  [ -n "$pg_db" ] || pg_db="supportdesk"
 
-  if container_running; then
-    was_running=true
-    warn "Brief downtime: stopping the app container for a consistent SQLite copy..."
-    docker compose stop app
-  else
-    info "App container is not running — copying files directly."
-  fi
-
-  # On any failure: restore service state and clean up.
   backup_failure() {
-    if [ "${was_running:-false}" = "true" ] && ! container_running; then
-      warn "Backup failed — restarting the app container..."
-      docker compose start app >/dev/null 2>&1 || true
-    fi
     if [ -n "${staging:-}" ] && [ -d "$staging" ]; then
       rm -rf "$staging"
     fi
@@ -457,28 +439,35 @@ cmd_backup() {
   }
   trap backup_failure ERR
 
-  info "Copying database files from volume '${db_vol}'..."
-  # Safe plain copy: SQLite is stopped cleanly (no writer, no hot journal).
-  docker run --rm -v "${db_vol}:/src:ro" -v "${staging}/db:/dst" "$image" \
-    sh -c 'cp -a /src/. /dst/'
-  info "Archiving storage volume '${stor_vol}'..."
-  docker run --rm -v "${stor_vol}:/src:ro" -v "${staging}:/dst" "$image" \
-    sh -c 'tar czf /dst/storage.tar.gz -C /src .'
+  info "Dumping database '${pg_db}' (pg_dump custom format, online — no downtime)..."
+  docker compose exec -T db pg_dump -U "$pg_user" -d "$pg_db" --format=custom --file=- > "${staging}/database.dump"
+
+  # Uploaded/persistent files live on the storage volume — archive them.
+  local stor_vol
+  stor_vol="$(volume_for /app/storage)"
+  if [ -n "$stor_vol" ]; then
+    info "Archiving storage volume '${stor_vol}'..."
+    local image
+    image="$(get_image)"
+    if docker image inspect "$image" >/dev/null 2>&1; then
+      docker run --rm -v "${stor_vol}:/src:ro" -v "${staging}:/dst" "$image" \
+        sh -c 'tar czf /dst/storage.tar.gz -C /src .'
+    else
+      warn "App image not present locally — using postgres:16-alpine to archive storage."
+      docker run --rm -v "${stor_vol}:/src:ro" -v "${staging}:/dst" postgres:16-alpine \
+        sh -c 'tar czf /dst/storage.tar.gz -C /src .'
+    fi
+  else
+    warn "Storage volume not found (app never started?) — archive will contain the database only."
+  fi
+
   info "Adding .env copy (permissions 600)..."
   cp "$ENV_FILE" "${staging}/.env"
   chmod 600 "${staging}/.env"
 
-  tar -C "$staging" -czf "$backup_path" .env db storage.tar.gz
+  tar -C "$staging" -czf "$backup_path" .env database.dump storage.tar.gz
   rm -rf "$staging"
   trap - ERR
-
-  if [ "$was_running" = "true" ]; then
-    info "Restarting the app container..."
-    docker compose start app
-    if ! wait_for_health 90; then
-      warn "App restarted but is not healthy yet — check './scripts/supportdesk.sh logs'."
-    fi
-  fi
 
   printf '%s\n' "$backup_path" > "${BACKUP_DIR}/.last-backup-path"
   ok "Backup created: ${backup_path} ($(du -h "$backup_path" | awk '{print $1}'))"
@@ -513,20 +502,15 @@ cmd_restore() {
     exit 1
   fi
 
-  local stamp staging image db_vol stor_vol was_running=false
+  local stamp staging pg_user pg_db was_running=false
   stamp="$(date +%Y%m%d-%H%M%S)"
   staging="$(mktemp -d "${DEPLOY_DIR}/.restore-${stamp}.XXXXXX")"
-  image="$(get_image)"
-  if ! docker image inspect "$image" >/dev/null 2>&1; then
-    err "Image '${image}' is not present locally — pull it first (docker pull ${image})."
-    rm -rf "$staging"
-    exit 1
-  fi
 
   info "Extracting archive..."
   tar -xzf "$file" -C "$staging"
-  if ! ls "${staging}"/db/*.db >/dev/null 2>&1; then
-    err "Archive does not contain a database file (db/*.db) — is this a Support Desk backup?"
+  if [ ! -f "${staging}/database.dump" ]; then
+    err "Archive does not contain database.dump — is this a v0.10+ Support Desk backup?"
+    info "Backups created by v0.9.x (SQLite) cannot be restored into PostgreSQL automatically."
     rm -rf "$staging"
     exit 1
   fi
@@ -534,17 +518,20 @@ cmd_restore() {
     warn "Archive contains no .env — the current .env will be kept."
   fi
 
-  db_vol="$(volume_for /app/db)"
-  stor_vol="$(volume_for /app/storage)"
-  if [ -z "$db_vol" ] || [ -z "$stor_vol" ]; then
-    err "Data volumes not found — run 'docker compose up -d' once before restoring."
+  if [ "$(docker compose ps -q db | xargs -r docker inspect -f '{{.State.Running}}' 2>/dev/null || true)" != "true" ]; then
+    err "The database container is not running — start the stack first (docker compose up -d)."
     rm -rf "$staging"
     exit 1
   fi
 
+  pg_user="$(env_value POSTGRES_USER)"
+  pg_db="$(env_value POSTGRES_DB)"
+  [ -n "$pg_user" ] || pg_user="supportdesk"
+  [ -n "$pg_db" ] || pg_db="supportdesk"
+
   if container_running; then
     was_running=true
-    info "Stopping the app container..."
+    info "Stopping the app container (database and cache stay up)..."
     docker compose stop app
   fi
 
@@ -553,20 +540,31 @@ cmd_restore() {
       warn "Restore failed — restarting the app container..."
       docker compose start app >/dev/null 2>&1 || true
     fi
-    err "Restore failed — volumes may be partially restored. Re-run with the most recent good backup."
+    err "Restore failed — the database may be partially restored. Re-run with the most recent good backup."
   }
   trap restore_failure ERR
 
-  info "Restoring database volume '${db_vol}'..."
-  docker run --rm -v "${db_vol}:/dst" -v "${staging}/db:/src:ro" "$image" \
-    sh -c 'find /dst -mindepth 1 -maxdepth 1 -exec rm -rf {} + && cp -a /src/. /dst/'
+  info "Restoring database '${pg_db}' (pg_restore --clean --if-exists)..."
+  docker compose exec -T db sh -c "pg_restore -U '$pg_user' -d '$pg_db' --clean --if-exists --no-owner" < "${staging}/database.dump"
+
   if [ -f "${staging}/storage.tar.gz" ]; then
-    info "Restoring storage volume '${stor_vol}'..."
-    docker run --rm -v "${stor_vol}:/dst" -v "${staging}:/src:ro" "$image" \
-      sh -c 'find /dst -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar xzf /src/storage.tar.gz -C /dst'
+    local image stor_vol
+    image="$(get_image)"
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+      image="postgres:16-alpine"
+    fi
+    stor_vol="$(volume_for /app/storage)"
+    if [ -n "$stor_vol" ]; then
+      info "Restoring storage volume '${stor_vol}'..."
+      docker run --rm -v "${stor_vol}:/dst" -v "${staging}:/src:ro" "$image" \
+        sh -c 'find /dst -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar xzf /src/storage.tar.gz -C /dst'
+    else
+      warn "Storage volume not found — storage files skipped."
+    fi
   else
     warn "No storage.tar.gz in the archive — storage volume left unchanged."
   fi
+
   if [ -f "${staging}/.env" ]; then
     info "Restoring .env (previous copy kept as .env.pre-restore-${stamp})..."
     if [ -f "$ENV_FILE" ]; then
@@ -754,15 +752,18 @@ cmd_status() {
   echo
 
   if container_exists; then
-    local db_vol stor_vol image
-    db_vol="$(volume_for /app/db)"
-    stor_vol="$(volume_for /app/storage)"
+    local stor_vol image
     image="$(docker inspect -f '{{.Config.Image}}' "$APP_CONTAINER" 2>/dev/null || true)"
     info "Running image: ${image:-unknown}"
-    if [ -n "$db_vol" ] && [ -n "$image" ]; then
-      info "Database volume usage (${db_vol}):"
-      docker run --rm -v "${db_vol}:/data:ro" "$image" du -sh /data 2>/dev/null || true
+    if docker inspect supportdesk-db >/dev/null 2>&1; then
+      info "Database size (supportdesk-db, volume supportdesk_pgdata):"
+      docker exec supportdesk-db du -sh /var/lib/postgresql/data 2>/dev/null || true
     fi
+    if docker inspect supportdesk-cache >/dev/null 2>&1; then
+      info "Cache memory (supportdesk-cache):"
+      docker exec supportdesk-cache redis-cli info memory 2>/dev/null | grep -E 'used_memory_human|maxmemory_human' || true
+    fi
+    stor_vol="$(volume_for /app/storage)"
     if [ -n "$stor_vol" ] && [ -n "$image" ]; then
       info "Storage volume usage (${stor_vol}):"
       docker run --rm -v "${stor_vol}:/data:ro" "$image" du -sh /data 2>/dev/null || true
@@ -827,9 +828,10 @@ Commands:
                     (e.g. 0.2.0). Without an argument, re-pulls the pinned tag.
   rollback          Health-gated switch back to the image recorded by the
                     last 'update' (.deploy-state). DB schema is not downgraded.
-  backup            Consistent backup archive (DB + storage + .env) under
-                    ./backups. Brief downtime while the app is stopped.
-  restore <file>    DESTRUCTIVE! Restore DB, storage and .env from a backup.
+  backup            Consistent ONLINE backup archive (pg_dump snapshot +
+                    storage + .env) under ./backups. No downtime.
+  restore <file>    DESTRUCTIVE! Restore DB (pg_restore), storage and .env
+                    from a v0.10+ backup.
   status            Compose status, health endpoint output, volume disk usage.
   logs [n]          Last n log lines (default 200).
   version           VERSION file vs running image vs health endpoint version.
@@ -854,6 +856,7 @@ SA_PASSWORD=""
 SA_APP_URL=""
 GEN_AUTH_SECRET=""
 GEN_ENC_KEY=""
+GEN_PG_PASSWORD=""
 
 if [ ! -f "$COMPOSE_FILE" ]; then
   err "docker-compose.yml not found in ${DEPLOY_DIR} — run this CLI from a Support Desk deployment folder."

@@ -44,8 +44,24 @@ const schema = z.object({
   LOGIN_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),
   LOGIN_LOCK_MINUTES: z.coerce.number().int().min(1).max(24 * 60).default(15),
 
+  /**
+   * Per-IP sliding-window login throttle (credential-stuffing guard).
+   * Defaults keep production strict (10 logins / 60 s per IP); CI and the
+   * verification suites raise the limit so consecutive suites do not trip
+   * the guard while it remains fully exercised by the lockout tests.
+   */
+  LOGIN_IP_LIMIT: z.coerce.number().int().min(1).max(10_000).default(10),
+  LOGIN_IP_WINDOW_SECONDS: z.coerce.number().int().min(1).max(3600).default(60),
+
   STORAGE_DIR: z.string().default("./storage"),
   FORCE_SECURE_COOKIES: z.enum(["true", "false"]).default("false"),
+
+  /**
+   * Shared cache (Redis). Optional: when absent the app falls back to the
+   * in-process L1 cache only (single-node dev/deployments). Docker compose
+   * sets redis://cache:6379 automatically.
+   */
+  REDIS_URL: z.string().optional(),
 });
 
 export type AppEnv = z.infer<typeof schema>;

@@ -2,11 +2,13 @@ import "server-only";
 
 import { z } from "zod";
 import { getSetting, setSetting } from "@/lib/settings";
+import { cacheGet, cacheSet, cacheDelete } from "@/lib/cache";
 
 /**
  * RAG engine configuration — stored in SystemSetting (`rag.engine`), validated
  * with zod, admin-editable without redeploy (task §11). Cached in-process for
- * a short TTL; every retrieval turn reads one consistent snapshot.
+ * a short TTL plus the shared cache layer for multi-instance deployments;
+ * every retrieval turn reads one consistent snapshot.
  *
  * Defaults live in a literal object (deep-merged with the stored patch BEFORE
  * parsing) so future engine versions can add knobs without data migrations.
@@ -138,17 +140,29 @@ function deepMergeDefaults(defaults: RagEngineSettings, patch: unknown): RagEngi
 
 let cache: { value: RagEngineSettings; at: number } | null = null;
 const CACHE_TTL_MS = 10_000;
+const SHARED_CACHE_KEY = "rag:config";
+const SHARED_CACHE_TTL_MS = 30_000;
 
 export function invalidateRagConfigCache(): void {
   cache = null;
+  void cacheDelete(SHARED_CACHE_KEY);
 }
 
 /** Load the effective engine settings (defaults deep-merged with stored patch). */
 export async function getRagEngineSettings(): Promise<RagEngineSettings> {
   if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.value;
+
+  // Shared L2 snapshot (already validated at write time).
+  const shared = await cacheGet<RagEngineSettings>(SHARED_CACHE_KEY);
+  if (shared) {
+    cache = { value: shared, at: Date.now() };
+    return shared;
+  }
+
   const raw = await getSetting<unknown>(RAG_SETTING_KEY);
   const merged = ragEngineSettingsSchema.parse(deepMergeDefaults(RAG_DEFAULTS, raw));
   cache = { value: merged, at: Date.now() };
+  void cacheSet(SHARED_CACHE_KEY, merged, SHARED_CACHE_TTL_MS);
   return merged;
 }
 

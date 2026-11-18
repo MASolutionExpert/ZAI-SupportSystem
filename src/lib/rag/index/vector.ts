@@ -48,8 +48,9 @@ export type VectorSearchResult = {
 
 const MAX_VECTOR_CANDIDATES = 4000;
 
-export class SqliteJsonVectorIndex implements VectorIndex {
-  readonly id = "sqlite-json-cosine";
+export class JsonInMemoryVectorIndex implements VectorIndex {
+  /** Provider-neutral id: JSON-stored embeddings scored in-process. */
+  readonly id = "json-cosine";
 
   async search(
     query: string,
@@ -168,5 +169,5 @@ export class SqliteJsonVectorIndex implements VectorIndex {
 
 /** Factory — the swap point for a pgvector implementation. */
 export function createVectorIndex(): VectorIndex {
-  return new SqliteJsonVectorIndex();
+  return new JsonInMemoryVectorIndex();
 }

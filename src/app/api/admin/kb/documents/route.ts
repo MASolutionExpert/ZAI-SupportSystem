@@ -37,7 +37,7 @@ export async function GET(req: NextRequest) {
       where: {
         ...(collectionId ? { collectionId } : {}),
         ...(status ? { status } : {}),
-        ...(q ? { title: { contains: q } } : {}),
+        ...(q ? { title: { contains: q, mode: "insensitive" } } : {}),
       },
       orderBy: { updatedAt: "desc" },
       take: 200,

@@ -59,16 +59,29 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 type Session = { cookie: string };
 
 async function login(username: string, password: string): Promise<Session> {
-  const res = await fetch(`${BASE}/api/auth/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Origin: ORIGIN },
-    body: JSON.stringify({ username, password }),
-  });
-  if (!res.ok) throw new Error(`login failed for ${username}: ${res.status}`);
-  const setCookie = res.headers.get("set-cookie") ?? "";
-  const cookie = setCookie.split(";")[0] ?? "";
-  if (!cookie) throw new Error("no session cookie returned");
-  return { cookie };
+  // Honest client: the per-IP login throttle may answer 401 + Retry-After when
+  // consecutive suites burst logins from 127.0.0.1. Wait out the window once
+  // instead of failing (the lockout checks below use raw req(), not this).
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await fetch(`${BASE}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: ORIGIN },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!res.ok) {
+      const retryAfter = Number(res.headers.get("retry-after") ?? "0");
+      if (attempt === 0 && retryAfter > 0 && retryAfter <= 70) {
+        await sleep((retryAfter + 1) * 1000);
+        continue;
+      }
+      throw new Error(`login failed for ${username}: ${res.status}`);
+    }
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    const cookie = setCookie.split(";")[0] ?? "";
+    if (!cookie) throw new Error("no session cookie returned");
+    return { cookie };
+  }
+  throw new Error(`login failed for ${username}: retries exhausted`);
 }
 
 type Res = {
@@ -175,12 +188,18 @@ async function main() {
     await injectionRobustness(admin);
     await aiGuardrails();
     await errorHandling(admin);
-    console.log("\n  ⏳ 65s wait — letting the per-IP login window clear before the throttle/lockout scenarios…");
-    await sleep(65_000);
-    await loginThrottle();
-    await sleep(65_000);
+    // The per-IP login window is env-tunable; at the production default (10)
+    // the lockout scenario needs a clear window, so wait it out. Raised CI
+    // limits make the wait unnecessary.
+    if (Math.max(2, Number(process.env.LOGIN_IP_LIMIT ?? "10")) <= 15) {
+      console.log("\n  ⏳ 65s wait — letting the per-IP login window clear before the lockout scenario…");
+      await sleep(65_000);
+    }
     await accountLockout(lockoutUsername, password);
     await healthEndpoint();
+    // The IP-saturating throttle burst runs LAST — no later section depends
+    // on the per-IP window, so it cannot interfere with other scenarios.
+    await loginThrottle();
   } finally {
     // Cleanup throwaway data.
     await db.session.deleteMany({ where: { userId: { in: [fileMgr.id, overrideUser.id, lockoutUser.id] } } });
@@ -217,11 +236,22 @@ async function headersAndCookies() {
   const api = await get("/api/health");
   check("API responses carry Cache-Control: no-store", (api.headers.get("cache-control") ?? "").includes("no-store"));
 
-  const loginRes = await fetch(`${BASE}/api/auth/login`, {
+  // Honor the per-IP login window: a previous consecutive suite run may have
+  // saturated it (its final throttle burst). Wait out Retry-After once.
+  let loginRes = await fetch(`${BASE}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Origin: ORIGIN },
     body: JSON.stringify({ username: ADMIN_USER, password: ADMIN_PASS }),
   });
+  const retryAfter = Number(loginRes.headers.get("retry-after") ?? "0");
+  if (!loginRes.ok && retryAfter > 0 && retryAfter <= 70) {
+    await sleep((retryAfter + 1) * 1000);
+    loginRes = await fetch(`${BASE}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: ORIGIN },
+      body: JSON.stringify({ username: ADMIN_USER, password: ADMIN_PASS }),
+    });
+  }
   const sc = loginRes.headers.get("set-cookie") ?? "";
   check("Session cookie is HttpOnly", /httponly/i.test(sc));
   check("Session cookie is SameSite=Lax", /samesite=lax/i.test(sc));
@@ -448,6 +478,10 @@ async function aiGuardrails() {
   // a keyword that cannot collide with any global source. Asking it from the
   // AI department must abstain — retrieval scope is resolved before any
   // provider call, so the out-of-scope entry must never be a candidate.
+  // The probe question is marker-heavy (many unique tokens) so weak lexical
+  // matches from common Persian words cannot push it into the clarify band —
+  // zero-match retrieval is deterministic; the security property (no leak of
+  // the other department's content) is asserted explicitly as well.
   const memberDept = departments.find((d) => d.name.includes("عضویت"));
   if (memberDept && aiDept.id !== memberDept.id) {
     const marker = `گلوگاپروتکل${Date.now().toString(36)}`;
@@ -463,9 +497,10 @@ async function aiGuardrails() {
       },
     });
     try {
-      const cross = await converse(aiDept.id, `روند ${marker} چیست؟`);
+      const cross = await converse(aiDept.id, `گزارش جامع درباره ${marker} در بخش اسناد ناظر گلوگا چگونه تدوین می‌شود`);
       const cText: string = cross.data.assistantMessage?.content ?? "";
       check("پرسش خارج از دامنه دپارتمان → abstention (دامنه قبل از provider حل می‌شود)", cText.startsWith(ABSTENTION_PREFIX), `reply: ${cText.slice(0, 60)}…`);
+      check("پاسخ خارج از دامنه هرگز محتوای مدخل دپارتمان دیگر را افشا نمی‌کند", !cText.includes(marker) && !cText.includes("پاسخ رسمی برای"), `reply: ${cText.slice(0, 60)}…`);
     } finally {
       await db.knowledgeQaDepartment.deleteMany({ where: { entryId: tempQa.id } });
       await db.knowledgeQaEntry.delete({ where: { id: tempQa.id } });
@@ -541,11 +576,15 @@ async function errorHandling(admin: Session) {
 // -------------------------------------------------------------- section 9
 
 async function loginThrottle() {
-  section("۹) محدودیت نرخ ورود (پنجره لغزان هر IP)");
-  // 10 logins/min/IP. Unknown usernames never lock accounts (timing-equalized).
+  section("۱۲) محدودیت نرخ ورود (پنجره لغزان هر IP) — سناریوی پایانی");
+  // The per-IP window is env-tunable (LOGIN_IP_LIMIT, default 10 / 60 s) so
+  // CI can raise it for burst-heavy consecutive suites. Fire limit+2 attempts
+  // and expect the guard to engage exactly past the configured limit.
+  const ipLimit = Math.max(2, Number(process.env.LOGIN_IP_LIMIT ?? "10"));
+  const attempts = ipLimit + 2;
   let sawRetryAfter = false;
   let fourHundredOne = 0;
-  for (let i = 0; i < 12; i += 1) {
+  for (let i = 0; i < attempts; i += 1) {
     const res = await req("POST", "/api/auth/login", {
       origin: ORIGIN,
       body: { username: `p7thr_${i}_${Date.now().toString(36)}`, password: "wrong-password" },
@@ -553,7 +592,7 @@ async function loginThrottle() {
     if (res.status === 401 && res.json?.code === "LOGIN_FAILED") fourHundredOne += 1;
     if (res.headers.get("retry-after")) sawRetryAfter = true;
   }
-  check("تمام ۱۲ تلاش پاسخ ۴۰۱ پاکت‌دار گرفتند (بدون کرش)", fourHundredOne === 12, `401s=${fourHundredOne}`);
+  check("تمام تلاش‌ها پاسخ ۴۰۱ پاکت‌دار گرفتند (بدون کرش)", fourHundredOne === attempts, `401s=${fourHundredOne}/${attempts}`);
   check("پنجره نرخ فعال شد (Retry-After در پاسخ‌های اضافه)", sawRetryAfter);
 }
 

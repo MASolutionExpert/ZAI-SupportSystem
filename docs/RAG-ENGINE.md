@@ -160,7 +160,7 @@ page/section — never internal ids, collection names, or internal metadata).
   (`builtin-hashed` + `openai-compatible`), DB-backed `RagJob` queue with
   in-process runner (instrumentation), `scripts/reingest-docs.ts`.
 - Stage 3: **complete** — `LexicalRetriever` (coverage + density + exact
-  phrase + identifier boost), `SqliteJsonVectorIndex` behind the
+  phrase + identifier boost), `JsonInMemoryVectorIndex` behind the
   `VectorIndex` interface (model/dim hard-match; mismatched vectors excluded,
   never silently searched), RRF fusion, query transformation
   (contextualize/rewrite/expand/decompose — budgeted, failure-tolerant),

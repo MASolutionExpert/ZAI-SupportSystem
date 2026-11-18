@@ -44,7 +44,7 @@ Based on the recommended foundation (Doc 06). Current-state facts [V]; target-st
 ## 4. AI/RAG subsystem (target state)
 
 - Engine unchanged; **production embeddings** via configured OpenAI-compatible endpoint; embedding model/dim mismatch safety already enforced at query time [V].
-- Scale-out: swap `SqliteJsonVectorIndex` for pgvector implementation behind `createVectorIndex()` factory [V — seam exists].
+- Scale-out: swap `JsonInMemoryVectorIndex` for pgvector implementation behind `createVectorIndex()` factory [V — seam exists].
 - Parsing sidecar (optional): RAGFlow receives files, returns structured text; our chunker/normalizer/indexer remain authoritative; sidecar output treated as untrusted data (injection rules unchanged).
 - Evals (`acceptance-v1` 8/8 baseline [V]) extended with adversarial corpus; eval gate required for any engine change.
 

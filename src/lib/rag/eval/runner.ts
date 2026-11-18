@@ -78,7 +78,7 @@ async function provisionFixtures(departmentId: string): Promise<Record<string, s
 
   // Membership-scoped grant collection for the isolation fixture.
   const membershipDept = await db.department.findFirst({
-    where: { name: { contains: "عضویت" } },
+    where: { name: { contains: "عضویت", mode: "insensitive" } },
     select: { id: true },
   });
   let scopedCollectionId = collection.id;
@@ -197,7 +197,7 @@ async function resolveDepartment(key: EvalCase["department"]): Promise<{ id: str
     tech: "پشتیبانی فنی",
   };
   const department = await db.department.findFirst({
-    where: { name: { contains: names[key] }, isActive: true },
+    where: { name: { contains: names[key], mode: "insensitive" }, isActive: true },
     select: { id: true, name: true },
   });
   if (!department) throw new Error(`دپارتمان دمو «${names[key]}» یافت نشد — ابتدا bun run seed-demo را اجرا کنید.`);
@@ -296,13 +296,13 @@ export async function runAcceptanceEvaluation(options?: { cleanupFixturesAfter?:
       for (const ref of evalCase.expect.gold ?? []) {
         if (ref.kind === "QA") {
           const entries = await db.knowledgeQaEntry.findMany({
-            where: { question: { contains: ref.questionIncludes }, status: "PUBLISHED" },
+            where: { question: { contains: ref.questionIncludes, mode: "insensitive" }, status: "PUBLISHED" },
             select: { id: true },
           });
           entries.forEach((entry) => goldKeys.add(entry.id));
         } else {
           const document = await db.knowledgeDocument.findFirst({
-            where: { title: { contains: ref.titleIncludes } },
+            where: { title: { contains: ref.titleIncludes, mode: "insensitive" } },
             select: { id: true },
           });
           if (document) goldKeys.add(document.id);
@@ -504,7 +504,7 @@ async function reindexIntegrityCheck(): Promise<EvalCaseResult> {
     const second = await ingestDocumentNow(documentId, SYSTEM_INGEST_ACTOR);
 
     const stale = await db.knowledgeChunk.count({
-      where: { documentId, text: { contains: "SIGMA-ALPHA-1" } },
+      where: { documentId, text: { contains: "SIGMA-ALPHA-1", mode: "insensitive" } },
     });
     const current = await db.knowledgeChunk.count({ where: { documentId } });
     const duplicates = await db.knowledgeChunk.groupBy({

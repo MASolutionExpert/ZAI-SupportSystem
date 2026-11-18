@@ -1,6 +1,6 @@
 # Support Desk — Deployment Guide
 
-Self-hosted deployment of **Support Desk** (Persian RTL organizational AI support desk & file hub), **v0.7.0 final** — all seven phases shipped: authentication/RBAC/audit foundation, departments & operators, knowledge base + grounded AI assistant, customer portal & ticketing with fair distribution, shared file hub with quotas and antivirus integration, super-admin reporting & audit viewer, and the production-hardening verification of this phase.
+Self-hosted deployment of the **ZAI Support System** (Persian RTL organizational AI support desk & file hub). **Since v0.10.0 the stack is Dockerized end-to-end**: the app runs against **PostgreSQL 16** (Prisma ORM) with **Redis 7** as the shared cache layer — each in its own container, with all data and media on named volumes so redeploys, updates and CLI operations never touch the data.
 
 This guide covers a **single-node, Docker-based production installation** with versioned images, safe migrations, backups, upgrades and rollback.
 
@@ -10,11 +10,12 @@ This guide covers a **single-node, Docker-based production installation** with v
 
 | Component | Implementation |
 |---|---|
-| Application | Next.js 16 (App Router) production server, **listens on port 3000**, runs as non-root user inside the container |
-| Database | **SQLite v1** (Prisma ORM) on the named volume `supportdesk_db` → `/app/db/supportdesk.db`. *No database service is deployed* — the Prisma schema is provider-portable to PostgreSQL later (see `DATABASE.md`) |
+| Application | Next.js 16 (App Router) production server (standalone), **listens on port 3000**, runs as non-root user inside the container; stateless except for `/app/storage` |
+| Database | **PostgreSQL 16** (`postgres:16-alpine`, Prisma ORM) — dedicated container `supportdesk-db`, data on the named volume `supportdesk_pgdata`. `DATABASE_URL` is built by Compose from the `POSTGRES_*` variables in `.env` |
+| Cache | **Redis 7** (`redis:7-alpine`, AOF persistence, 256 MB allkeys-lru) — dedicated container `supportdesk-cache`; shared L2 behind the app's in-process L1 cache (`src/lib/cache.ts`). Losing Redis never breaks the app — it falls back to memory |
 | File storage | Named volume `supportdesk_storage` → `/app/storage` (`STORAGE_DIR`) — KB documents, ticket attachments and shared file-hub blobs (randomized keys, outside the web root) |
-| Migrations | Versioned (`20261115142728_init_phase1_foundation` → `20261116130000_phase5_file_hub`), applied with `prisma migrate deploy` (pending-only, never resets) on startup (`MIGRATE_ON_STARTUP=true`) |
-| Health | `GET /api/health` → `200 {"status":"ok","checks":{"database":true},...}` or `503` when the database is unreachable; wired into the Docker `HEALTHCHECK` and compose healthcheck |
+| Migrations | Versioned PostgreSQL migrations (`prisma/migrations`, baseline `20261119000000_init_postgresql`), applied with `prisma migrate deploy` (pending-only, never resets) on startup (`MIGRATE_ON_STARTUP=true`) |
+| Health | `GET /api/health` → `200 {"status":"ok","checks":{"database":true,"cache":"redis"},...}` or `503` when the database is unreachable; wired into the Docker `HEALTHCHECK` and compose healthcheck |
 | Reverse proxy | Optional Caddy 2 overlay (automatic HTTPS) or your own nginx |
 | Management | `./scripts/supportdesk.sh` (`install`, `update`, `backup`, `restore`, `status`, `logs`, `version`, `help`) |
 | CI/CD | GitHub Actions: `ci.yml` (lint/typecheck/build) and `release.yml` (publishes versioned images to ghcr.io — `X.Y.Z`, `X.Y`, `X`; **never** `:latest`) |
@@ -75,13 +76,13 @@ cd /opt/zai-supportsystem
 The installer is **idempotent** — re-running it never overwrites an existing `.env` or any data. It performs, in order:
 
 1. Verifies Docker, Docker Compose v2, curl and openssl are available.
-2. Creates `.env` from `.env.example` if missing (mode `600`), **generating `AUTH_SECRET` (openssl rand -base64 48) and `APP_ENCRYPTION_KEY` (openssl rand -base64 32)** automatically.
+2. Creates `.env` from `.env.example` if missing (mode `600`), **generating `AUTH_SECRET` (openssl rand -base64 48), `APP_ENCRYPTION_KEY` (openssl rand -base64 32) and `POSTGRES_PASSWORD` (openssl rand -hex 24)** automatically.
 3. Prompts (hidden input) for the **initial Super Admin password** and refuses weak ones (< 12 chars or missing upper/lower/digit). The password is written only to `.env` and never committed or echoed.
-4. Creates local working directories (`./backups`, placeholders `./db`, `./storage`); real data lives in the named Docker volumes.
+4. Creates the local working directory `./backups`; real data (database, cache, media) lives in the named Docker volumes.
 5. Pulls the pinned image (`SUPPORTDESK_IMAGE` from `.env`; when unset the installer pins `ghcr.io/miladalefbusiness/zai-supportsystem:<VERSION>` — the image published by the Release workflow).
 6. Checks host-port availability and prints DNS/domain notes.
 7. Starts services with `docker compose up -d`.
-8. The container entrypoint runs `prisma migrate deploy` (applies pending migrations only; creates the SQLite file if missing) and the app **bootstraps roles/permissions + the Super Admin only if missing** (`BOOTSTRAP_ON_STARTUP=true` — never overwrites existing data).
+8. Compose starts the three containers (`db` + `cache` gate the app via healthchecks); the app entrypoint waits for PostgreSQL, runs `prisma migrate deploy` (applies pending migrations only, never resets) and the app **bootstraps roles/permissions + the Super Admin only if missing** (`BOOTSTRAP_ON_STARTUP=true` — never overwrites existing data).
 9. Waits up to 120 s for `/api/health` to return 200 and prints next steps.
 
 ### Step 3 — First login
@@ -107,7 +108,10 @@ Written into `.env` (from `.env.example`). **Never commit the real `.env`.**
 
 | Variable | Required | Example / default | Purpose |
 |---|---|---|---|
-| `DATABASE_URL` | yes | `file:/app/db/supportdesk.db` | SQLite file location (inside container, on the `supportdesk_db` volume) |
+| `POSTGRES_USER` | yes | `supportdesk` | Database user; Compose builds `DATABASE_URL` for the app from the `POSTGRES_*` variables — do **not** set `DATABASE_URL` in `.env` for compose deployments |
+| `POSTGRES_PASSWORD` | yes | *generated* — `openssl rand -hex 24` | Database password (URL-safe hex; generated by the installer) |
+| `POSTGRES_DB` | yes | `supportdesk` | Database name |
+| `REDIS_URL` | no (compose injects) | `redis://cache:6379` | Shared cache layer; absent/unreachable → in-process fallback (never fails requests) |
 | `AUTH_SECRET` | yes | *generated* — `openssl rand -base64 48` | Session integrity secret, min 32 chars; `supportdesk install` generates it |
 | `APP_ENCRYPTION_KEY` | optional (reserved) | *generated* — `openssl rand -base64 32` | 32-byte base64 key reserved for app-level PII encryption in later phases |
 | `APP_URL` | optional | `https://support.example.com` | Canonical public URL |
@@ -122,7 +126,9 @@ Written into `.env` (from `.env.example`). **Never commit the real `.env`.**
 | `MIGRATE_ON_STARTUP` | optional | `true` | Entrypoint runs `prisma migrate deploy` on start; `false` = manual migrations |
 | `APP_VERSION` | optional | *(empty)* | Override; normally read from the `VERSION` file |
 
-Compose/CLI-only extras (not read by the app): `SUPPORTDESK_IMAGE` (pinned image reference, e.g. `ghcr.io/<org>/<repo>:0.1.0`) and `APP_PORT` (host port; container always listens on 3000).
+Standalone (non-compose) runs must set `DATABASE_URL=postgresql://<user>:<password>@<host>:5432/<db>?schema=public` explicitly.
+
+Compose/CLI-only extras (not read by the app): `SUPPORTDESK_IMAGE` (pinned image reference, e.g. `ghcr.io/<org>/<repo>:0.10.0`) and `APP_PORT` (host port; container always listens on 3000).
 
 ---
 
@@ -174,19 +180,21 @@ The **Production Deploy** workflow (`deploy.yml`, manual trigger) wraps exactly 
 
 | Volume | Mount point | Contents |
 |---|---|---|
-| `supportdesk_db` | `/app/db` | SQLite database (`supportdesk.db`) |
-| `supportdesk_storage` | `/app/storage` | Uploaded/persistent files |
+| `supportdesk_pgdata` | `/var/lib/postgresql/data` (db container) | PostgreSQL data directory (all relational data) |
+| `supportdesk_redis` | `/data` (cache container) | Redis AOF persistence (cache only — recomputed from the DB if lost) |
+| `supportdesk_storage` | `/app/storage` (app container) | Uploaded/persistent files |
 
 - Volumes survive rebuilds, upgrades and restarts; directories inside the image are pre-created as **uid 1000 (`node`)** so volumes inherit safe ownership on first use.
 - Inspect actual (project-prefixed) names with `docker volume ls | grep supportdesk`.
 - Do **not** switch to host bind mounts unless you replicate the ownership (`chown -R 1000:1000`).
-- `supportdesk status` reports current disk usage of both volumes.
+- Volumes are **never touched** by `update`, `rollback` or `docker compose up -d` — only `restore` (explicitly confirmed) and manual `docker volume rm` replace data.
+- `supportdesk status` reports database size, cache memory and storage usage.
 
 ---
 
 ## 8. Health monitoring
 
-- Endpoint: `GET /api/health` → `200 {"status":"ok","checks":{"database":true},"version":"0.1.0","uptimeSeconds":123,"timestamp":"ISO"}`; `503` when the database is unreachable.
+- Endpoint: `GET /api/health` → `200 {"status":"ok","checks":{"database":true,"cache":"redis"},"cache":{"backend":"redis","redisStatus":"ready"},"version":"0.10.0","uptimeSeconds":123,"timestamp":"ISO"}`; `503` when the database is unreachable. `checks.cache` reports `"memory"` when Redis is not configured/reachable — informational only, health stays green.
 - Docker/compose healthcheck runs every 30 s (`docker compose ps` shows `(healthy)` / `(unhealthy)`).
 - Quick check: `curl -fsS http://127.0.0.1:3000/api/health` or `./scripts/supportdesk.sh status`.
 - For external monitoring, poll `/api/health` and alert on non-200 responses or `status != "ok"`.
@@ -221,8 +229,9 @@ server {
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Entrypoint exits with “DATABASE_URL is not set” | `.env` missing or not next to `docker-compose.yml` | Create `.env` (`./scripts/supportdesk.sh install`); compose loads it via `env_file` |
-| `/api/health` returns `503` with `"database":false` | SQLite can't be opened/created | Check `docker compose logs app`; verify the `supportdesk_db` volume is mounted, disk not full, and `DATABASE_URL=file:/app/db/supportdesk.db` |
-| `EACCES` / permission errors on `/app/db` or `/app/storage` | Volume owned by another uid (e.g. created via root bind mount) | Use named volumes; repair with `docker run --rm -u root -v supportdesk_db:/data <image> chown -R node:node /data` (same for storage) |
+| `/api/health` returns `503` with `"database":false` | PostgreSQL unreachable / credentials wrong | `docker compose ps` + `docker compose logs db`; verify `POSTGRES_PASSWORD` in `.env` matches the volume's initialized password (changing `POSTGRES_PASSWORD` alone does NOT re-initialize an existing volume) |
+| Entrypoint exits with “DATABASE_URL is not a PostgreSQL URL” | A stale `file:` URL from a ≤ v0.9 `.env` | Remove any hand-set `DATABASE_URL` from `.env` (compose builds it); for standalone runs use a `postgresql://` URL |
+| `EACCES` / permission errors on `/app/storage` | Volume owned by another uid (e.g. created via root bind mount) | Use named volumes; repair with `docker run --rm -u root -v supportdesk_storage:/data <image> chown -R node:node /data` |
 | “address already in use” / port 3000 busy | Another service on the host port | Set `APP_PORT=8080` (example) in `.env`, then `docker compose up -d` |
 | `pull access denied` for `ghcr.io/...` | Package is private and you are not authenticated | `docker login ghcr.io` (token with `read:packages`), make the package public, or point `SUPPORTDESK_IMAGE` at your mirror |
 | `manifest unknown` / tag not found | Wrong or unpublished version tag | List available tags in the registry; pin an exact published `X.Y.Z` |
@@ -238,7 +247,7 @@ server {
 |---|---|
 | `./scripts/supportdesk.sh install` | First install / re-run safe idempotent install |
 | `./scripts/supportdesk.sh update [X.Y.Z]` | Backup + pull + deploy a version |
-| `./scripts/supportdesk.sh backup` | Consistent backup archive (brief downtime) |
+| `./scripts/supportdesk.sh backup` | Consistent backup archive (pg_dump snapshot + storage + .env — online, no downtime) |
 | `./scripts/supportdesk.sh restore <file>` | Restore DB/storage/.env (destructive, asks YES) |
 | `./scripts/supportdesk.sh status` | Services, health JSON, volume usage, backups |
 | `./scripts/supportdesk.sh logs [n]` | Last n app log lines (default 200) |
@@ -250,7 +259,7 @@ server {
 
 ## 12. Honest limitations (final)
 
-- **Single-node by design:** SQLite is single-writer; run exactly one app instance. Horizontal scale-out switches to PostgreSQL per `DATABASE.md` §5 (runbook verified as documented; execution requires a PostgreSQL host and the §5.2 export/import step).
+- **Scale-out ready, single-node default:** PostgreSQL + Redis remove the single-writer constraint, so multiple app replicas can share the stack behind a load balancer. Rate limiting remains per-process (in-memory) until an external limiter is added — replicate-aware operators should size LB session affinity accordingly.
 - **Rate limiting is per-process** (in-memory): conversations, OTP, portal creation, login throttle and AI daily limits reset on restart and are not shared across replicas — consistent with the single-node design.
 - **Rollback after incompatible migrations is manual** (backup-and-restore), not automatic — Prisma migrations never down-migrate; `supportdesk update` always backs up first for exactly this reason.
 - **Antivirus is an integration point:** production must provision a clamd daemon; without it the file hub honestly reports «بدون اسکن» instead of pretending.

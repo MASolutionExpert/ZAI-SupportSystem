@@ -1,6 +1,6 @@
 # DATABASE.md — Support Desk
 
-Status: Phase 4 schema (Prisma ORM 6, SQLite v1) — Phase 1 implemented by migration `20261115142728_init_phase1_foundation`; Phase 2 added `20261116053120_phase2_operator_availability` (`User.isAvailable`); Phase 3 added `20261116070919_phase3_kb_ai` (KB, conversations, retrieval records, AI usage logs, `Department.aiSettings`); Phase 4 added `20261116093322_phase4_tickets_portal` (customer profiles, identity verification records, tickets, ticket messages/attachments/status history, notifications, `Department.ticketSettings`, `Conversation.customerId`) and `20261116094650_phase4_ticket_nullable_customer` (ticket `customerId` nullable, `SetNull`). Companion docs: [ARCHITECTURE.md](ARCHITECTURE.md), [SECURITY.md](SECURITY.md), [BACKUP-RESTORE.md](BACKUP-RESTORE.md) (maintained separately).
+Status: **PostgreSQL data layer (Prisma ORM 6) since v0.10.0** — single baseline migration `20261119000000_init_postgresql` created from the schema (37 models). Historical note: v0.9.x and earlier shipped on SQLite with seven SQLite-dialect migrations (`20261115142728_init_phase1_foundation` … `20261118090000_phase8_citizen_accounts`); those files were retired with the re-baseline (see §5). — Phase 1 implemented by migration `20261115142728_init_phase1_foundation`; Phase 2 added `20261116053120_phase2_operator_availability` (`User.isAvailable`); Phase 3 added `20261116070919_phase3_kb_ai` (KB, conversations, retrieval records, AI usage logs, `Department.aiSettings`); Phase 4 added `20261116093322_phase4_tickets_portal` (customer profiles, identity verification records, tickets, ticket messages/attachments/status history, notifications, `Department.ticketSettings`, `Conversation.customerId`) and `20261116094650_phase4_ticket_nullable_customer` (ticket `customerId` nullable, `SetNull`). Companion docs: [ARCHITECTURE.md](ARCHITECTURE.md), [SECURITY.md](SECURITY.md), [BACKUP-RESTORE.md](BACKUP-RESTORE.md) (maintained separately).
 
 ## 1. Entity-relationship overview
 
@@ -160,62 +160,47 @@ All schema changes go through **version-controlled migrations** — never `prism
 
 Existing migration: `20261115142728_init_phase1_foundation` (creates all 10 Phase-1 tables and their indexes). Spec §15 rules apply: no destructive initialization on restart; demo data only via the explicit `bun run seed-demo` path against a development/verified-empty database.
 
-### 4.1 Phase 4 SQLite runtime configuration (as-built)
+### 4.1 PostgreSQL runtime configuration (as-built, v0.10.0)
 
-The Phase-4 concurrency test surfaced a real operational requirement for SQLite: parallel write transactions over a multi-connection pool hit `SQLITE_BUSY`/pool timeouts. The shipped configuration is:
-
-- `DATABASE_URL` carries **`?connection_limit=1`** — all queries serialize through one connection, which matches the single-node design and makes interactive transactions uncontended (deterministic, no lock errors). Scale-out deployments switch to PostgreSQL (§5), where pool sizing returns.
-- The database file uses **WAL journal mode** (set once via `PRAGMA journal_mode=WAL`; persisted in the DB file — survive restarts). WAL adds durability and read/write concurrency headroom.
-- At the application layer, assignment-affecting operations (ticket creation, auto-assign, transfer) serialize through an **in-process lock** (`withAssignmentLock`) so the `MAX(number)+1` allocation and load counting stay deterministic; this lock is the application-side counterpart of PostgreSQL row locks after the switch.
+- **Connection URL**: plain `postgresql://…?schema=public` — no `connection_limit` parameter. Prisma's default pool (`num_cpus * 2 + 1`) is correct for PostgreSQL row locking; the SQLite-era single-connection serialization is gone.
+- **Docker wiring**: Compose builds `DATABASE_URL` from `POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB` and injects it into the app container (db service: `postgres:16-alpine`, healthcheck `pg_isready`, volume `supportdesk_pgdata`).
+- **Ticket numbering**: `MAX(number)+1` inside the creation transaction plus a **unique constraint** on `Ticket.number`; under concurrent creation the loser gets P2002 and the retry loop re-reads the maximum with jittered backoff. The in-process `withAssignmentLock` remains as a same-instance optimization; cross-instance correctness comes from the constraint + retry.
+- **Case sensitivity**: PostgreSQL `LIKE` is case-sensitive — all user-facing `contains`/`startsWith` searches pass `mode: "insensitive"` to preserve the SQLite-era behavior.
+- **Local development without Docker**: `bun run db:up` boots a real PostgreSQL via `embedded-postgres` (official binaries, data in gitignored `db/pgdata/`, port 5433).
 
 ### 4.2 Reconciling a `db push`-provisioned database with the migration history (Phase 7 finding)
 
-A database created with `prisma db push` has a schema but **no migration bookkeeping**. Do **not** "reconcile" it by resolving every migration as applied (`prisma migrate resolve --applied <name>`) and then running `prisma migrate deploy`. Reproduced and confirmed harmful in Phase 7: SQLite migrations generated for `ALTER TABLE` changes use the **table-rebuild pattern** (`CREATE TABLE "new_X" … INSERT … SELECT … DROP TABLE "X" … RENAME`). Re-running an *early* rebuild migration against an already-evolved schema recreates the table with the **early-era column set** and silently **drops columns added by later migrations** (e.g. phase 2's `new_User` rebuild drops phase 5's `User.storageQuotaBytes`). No error is raised — the data column simply disappears.
+A database created with `prisma db push` has a schema but **no migration bookkeeping**. Do **not** "reconcile" it by resolving every migration as applied (`prisma migrate resolve --applied <name>`) and then running `prisma migrate deploy` — bookkeeping and real schema can silently disagree. Historical note: on SQLite this was confirmed harmful (the table-rebuild migration pattern dropped later-era columns on replay); PostgreSQL migrations use plain `ALTER TABLE`/`CREATE INDEX` so the worst case is a failing migration rather than silent data loss, but the rule stands. If a push-built database must adopt the history, take a backup and recreate it fresh via `migrate deploy`, then re-import the data.
 
 If a `db push`-built database must adopt the migration history:
 
 1. **Take a backup first** (see BACKUP-RESTORE.md) — the procedure can go wrong.
 2. `bunx prisma migrate diff --from-url <DATABASE_URL> --to-schema-datamodel prisma/schema.prisma` — verify the live schema actually matches the model (expected for a healthy push-built DB).
-3. Resolve migrations as applied **without ever running `migrate deploy` afterwards on that database**, OR (recommended, small data volumes) create a **fresh database via `migrate deploy`** (bookkeeping-consistent from the first table) and re-import the data per the §5.2 export/import procedure.
-4. Sanity-check `PRAGMA table_info('<table>')` for the newest columns of each phase before going live.
+3. (Recommended) create a **fresh database via `migrate deploy`** (bookkeeping-consistent from the first table) and re-import the data.
 
 For the standard path — databases created by `migrate deploy` from scratch — none of this applies: bookkeeping and schema always agree, and re-running `migrate deploy` is a verified no-op ("No pending migrations").
 
 ---
 
-## 5. SQLite → PostgreSQL switch runbook
+## 5. The v0.10.0 PostgreSQL re-baseline (completed)
 
-The Phase-1 schema deliberately avoids SQLite-specific constraints, so models port unchanged. What changes is the provider line and (because the existing migration files contain SQLite-dialect SQL) the migration baseline on the PostgreSQL side.
+The switch executed in v0.10.0 followed exactly the planned re-baseline:
 
-### 5.1 Fresh PostgreSQL deployment (new installation)
+1. `prisma/schema.prisma` datasource switched to `provider = "postgresql"` (models unchanged — the schema was written provider-portable from day one).
+2. The seven SQLite-dialect migrations were **retired** (they cannot replay against PostgreSQL) and replaced by a single offline-generated baseline: `bunx prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma --script` → `prisma/migrations/20261119000000_init_postgresql/migration.sql` + `migration_lock.toml` (`provider = "postgresql"`).
+3. Fresh deployments apply it with `prisma migrate deploy` (compose entrypoint runs it automatically on first start; CI applies it against the PostgreSQL service container).
 
-1. Provision PostgreSQL and create a database, e.g. `supportdesk`.
-2. Set the datasource in `prisma/schema.prisma`:
-   ```prisma
-   datasource db {
-     provider = "postgresql"
-     url      = env("DATABASE_URL")
-   }
-   ```
-3. Set `DATABASE_URL` to the Postgres connection string in the environment (e.g. `postgresql://user:pass@host:5432/supportdesk`).
-4. Re-baseline migrations for the new dialect: with the schema provider switched, run `bunx prisma migrate dev --name init_postgresql_baseline` against the fresh database **in development** to generate the PostgreSQL-dialect baseline, commit it to `prisma/migrations/`, and review the generated SQL. (Do **not** replay the old SQLite migration files against Postgres — the dialects differ.)
-5. Apply in production with `bun run db:deploy`.
-6. Run `bun run bootstrap` (roles/permissions/super admin) exactly as in a fresh install.
+**Migrating an existing v0.9.x (SQLite) deployment with data** is an explicit export/import (one-time; scripted tooling is follow-up work):
 
-### 5.2 Existing SQLite deployment with data
-
-Migrating live data is an **explicit export/import step**, documented and executed per deployment (a scripted path remains follow-up tooling — the Phase 6 admin panel ships reporting/settings/audit modules, not a migration wizard; until then the procedure is):
-
-1. Stop the application; take a full backup (see [BACKUP-RESTORE.md](BACKUP-RESTORE.md)).
-2. Export the SQLite data to a neutral interchange format (JSON rows per table — including JSON-in-String fields verbatim; cuid IDs are strings, so they survive round-trips).
-3. Stand up PostgreSQL per §5.1 steps 1–5 (fresh schema).
-4. Import the exported rows table by table, preserving IDs; verify counts and spot-check referential integrity (e.g. every `User.roleKey` resolves).
-5. Re-run `bun run bootstrap` — it is idempotent: it re-syncs roles/permissions and skips the super admin if one exists (never overwrites).
-6. Start the application against PostgreSQL and verify `GET /api/health` plus `/api/admin/system-status` counts before decommissioning the SQLite file (keep it archived per backup policy).
+1. Keep the old v0.9 stack stopped and archived (its SQLite file is the source of truth until the cut-over succeeds).
+2. Deploy v0.10.0 per DEPLOYMENT.md (fresh PostgreSQL via `migrate deploy` + `bootstrap`).
+3. Export the SQLite rows to JSON per table (cuid IDs are strings, JSON-in-String fields copy verbatim) and import them table by table, preserving IDs; verify counts and referential integrity (e.g. every `User.roleKey` resolves).
+4. Re-run `bun run bootstrap` (idempotent — re-syncs roles/permissions, never overwrites data) and verify `GET /api/health` plus admin report counts before decommissioning the archived file.
+   v0.9 backups (`db/*.db` file archives) cannot be restored into PostgreSQL via `supportdesk restore` — they are source material for step 3 only.
 
 ### 5.3 Revisit triggers (from [ARCHITECTURE.md](ARCHITECTURE.md) D1)
 
-Multi-node deployment, high write concurrency, PostgreSQL full-text search for the knowledge base, row-level locking for the fair ticket-assignment engine, or JSONB querying — realistically Phase 3+ scale.
+pgvector for the RAG index (the `createVectorIndex()` factory seam already isolates the in-memory JSON scorer), PostgreSQL full-text search for the knowledge base, external rate-limiting in Redis for multi-replica deployments, JSONB querying for the JSON-in-String fields.
 
 ---
 
@@ -235,7 +220,7 @@ The national ID (کد ملی) is the customer identity attribute, but it is **ne
 
 ## 7. Backup pointers
 
-SQLite v1 means the database is **one file** (`DATABASE_URL`, e.g. `file:./db/custom.db`): backup = consistent file copy (with the app stopped or using SQLite's backup semantics), restore = file replace. Storage files (from Phase 5) live outside the DB in `STORAGE_DIR` and are backed up alongside. Full procedures, schedules, and restore drills: [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
+The database is **PostgreSQL** (`supportdesk_pgdata` volume): backup = `pg_dump --format=custom` snapshot (online, MVCC-consistent — `./scripts/supportdesk.sh backup` wraps it together with the storage volume and `.env`), restore = `pg_restore --clean --if-exists`. Storage files live outside the DB in `STORAGE_DIR` and are backed up alongside. Full procedures, schedules, and restore drills: [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
 
 ---
 
