@@ -1,0 +1,128 @@
+# =============================================================================
+# ZAI Support System — Production Deploy (manual, health-gated, auto-rollback)
+#
+# Deploys a versioned image to your server over SSH. The server side already
+# knows how to deploy safely — the management CLI does:
+#     backup  ->  pull new image  ->  recreate container  ->  health gate
+# and if the health gate fails, this workflow AUTOMATICALLY rolls back to the
+# previously running image (recorded by the CLI in .deploy-state).
+#
+# One-time server + repository setup (see README "Deploying via GitHub"):
+#   1. On the server: install Docker, clone the repo, run
+#        ./scripts/supportdesk.sh install
+#      so the deployment folder (default /opt/zai-supportsystem) exists.
+#   2. In GitHub: Settings -> Environments -> create "production"
+#      (optionally protect it with required reviewers).
+#   3. In GitHub: Settings -> Secrets and variables -> Actions, add:
+#        GH_DEPLOY_HOST      server IP / hostname (e.g. 203.0.113.10)
+#        GH_DEPLOY_USER      SSH user (e.g. root or deploy)
+#        GH_DEPLOY_SSH_KEY   PRIVATE key allowed to log in as that user
+#        GH_DEPLOY_PORT      (optional, default 22)
+#        GH_DEPLOY_PATH      (optional, default /opt/zai-supportsystem)
+#
+# Run: Actions -> "Production Deploy" -> Run workflow
+#   image_tag: leave empty to deploy the version in the VERSION file.
+# =============================================================================
+name: Production Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (empty = VERSION file value)"
+        required: false
+        type: string
+      auto_rollback:
+        description: "Roll back automatically if the health gate fails"
+        required: false
+        default: true
+        type: boolean
+
+permissions: {}  # deployment needs no repository permissions
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    env:
+      DEPLOY_HOST: ${{ secrets.GH_DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.GH_DEPLOY_USER }}
+      DEPLOY_KEY: ${{ secrets.GH_DEPLOY_SSH_KEY }}
+      DEPLOY_PORT: ${{ vars.GH_DEPLOY_PORT }}
+      DEPLOY_PATH: ${{ vars.GH_DEPLOY_PATH }}
+    steps:
+      - name: Check required secrets
+        run: |
+          missing=0
+          for v in DEPLOY_HOST DEPLOY_USER DEPLOY_KEY; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::Required repository secret '${v}' is not set."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Set GH_DEPLOY_HOST, GH_DEPLOY_USER and GH_DEPLOY_SSH_KEY in"
+            echo "Settings -> Secrets and variables -> Actions (see README, 'Deploying via GitHub Actions')."
+            exit 1
+          fi
+
+      - name: Checkout (read VERSION for the default tag)
+        uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="$(tr -d '[:space:]' < VERSION)"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Deploying image tag: ${TAG}"
+
+      - name: Prepare SSH key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "SSH key prepared (host: ${DEPLOY_HOST}, user: ${DEPLOY_USER}, port: ${DEPLOY_PORT:-22})."
+
+      - name: Deploy (backup -> pull -> health gate)
+        id: deploy
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=15 \
+              -o BatchMode=yes \
+              -p "${DEPLOY_PORT:-22}" \
+              "${DEPLOY_USER}@${DEPLOY_HOST}" \
+              "cd '${DEPLOY_PATH:-/opt/zai-supportsystem}' && ./scripts/supportdesk.sh update '${{ steps.tag.outputs.tag }}'"
+
+      - name: Automatic rollback (health gate failed)
+        if: failure() && steps.deploy.outcome == 'failure' && inputs.auto_rollback
+        run: |
+          echo "::warning::Deployment health gate failed — rolling back automatically."
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=15 \
+              -o BatchMode=yes \
+              -p "${DEPLOY_PORT:-22}" \
+              "${DEPLOY_USER}@${DEPLOY_HOST}" \
+              "cd '${DEPLOY_PATH:-/opt/zai-supportsystem}' && SUPPORTDESK_NONINTERACTIVE=1 ./scripts/supportdesk.sh rollback"
+
+      - name: Post-deploy verification
+        if: success()
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=15 \
+              -o BatchMode=yes \
+              -p "${DEPLOY_PORT:-22}" \
+              "${DEPLOY_USER}@${DEPLOY_HOST}" \
+              "cd '${DEPLOY_PATH:-/opt/zai-supportsystem}' && ./scripts/supportdesk.sh version"

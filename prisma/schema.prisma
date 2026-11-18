@@ -1,0 +1,795 @@
+// ============================================================================
+// Support Desk — Organizational AI Support Desk & File Hub
+// Phase 1 Foundation Schema (Prisma + SQLite v1; provider is portable to
+// PostgreSQL later without model changes — see DATABASE.md)
+//
+// Conventions:
+//  - SQLite has no native enums/JSON in Prisma: status/type fields are String
+//    validated at the application layer (Zod + TS unions), JSON payloads are
+//    stored as serialized strings in clearly-named fields.
+//  - Customer national IDs are NEVER stored as relational keys (Phase 4 will
+//    use app-level encryption + keyed HMAC lookup, see SECURITY.md).
+//  - All changes go through version-controlled migrations (prisma/migrations).
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Identity & Access (staff accounts: Super Admin / managers / operators)
+// ----------------------------------------------------------------------------
+
+model User {
+  id                  String    @id @default(cuid())
+  username            String    @unique
+  email               String?
+  name                String
+  passwordHash        String
+  roleKey             String
+  status              String    @default("ACTIVE") // ACTIVE | INACTIVE | SUSPENDED
+  isAvailable         Boolean   @default(true) // operator availability for fair distribution (Phase 2)
+  storageQuotaBytes   Int? // Phase 5: per-operator file quota (null → department/default fallback)
+  mustChangePassword  Boolean   @default(false)
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  lastLoginAt         DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  role        Role                     @relation(fields: [roleKey], references: [key])
+  sessions    Session[]
+  memberships DepartmentMembership[]
+  overrides   UserPermissionOverride[]
+  audits      AuditLog[]
+
+  // Phase 3 references (KB uploads / Q&A authorship / assigned conversations)
+  kbDocumentsUploaded   KnowledgeDocument[]        @relation("KbDocumentsUploaded")
+  kbVersionsUploaded    KnowledgeDocumentVersion[] @relation("KbVersionsUploaded")
+  kbQaCreated           KnowledgeQaEntry[]         @relation("KbQaCreated")
+  conversationsAssigned Conversation[]             @relation("ConversationsAssigned")
+
+  // Phase 4 references (ticketing)
+  ticketsAssigned Ticket[]        @relation("TicketsAssigned")
+  ticketMessages  TicketMessage[] @relation("TicketMessagesAuthor")
+  notifications   Notification[]  @relation("NotificationsUser")
+
+  // Phase 5 references (shared file hub)
+  sharedFoldersCreated SharedFolder[] @relation("SharedFoldersCreated")
+  sharedFilesUploaded  SharedFile[]   @relation("SharedFilesUploaded")
+
+  @@index([roleKey])
+  @@index([status])
+}
+
+model Role {
+  key         String   @id // SUPER_ADMIN | OPERATOR | FILE_MANAGER (system) + custom roles later
+  name        String // Persian display name
+  description String?
+  isSystem    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users       User[]
+  permissions RolePermission[]
+}
+
+model Permission {
+  key         String  @id // e.g. "tickets.reply", "files.upload", "admin.audit.view"
+  category    String // ADMIN | SUPPORT | FILES | KB | AI
+  description String?
+
+  roles     RolePermission[]
+  overrides UserPermissionOverride[]
+
+  @@index([category])
+}
+
+model RolePermission {
+  roleKey       String
+  permissionKey String
+  assignedAt    DateTime @default(now())
+
+  role       Role       @relation(fields: [roleKey], references: [key], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+
+  @@id([roleKey, permissionKey])
+}
+
+model UserPermissionOverride {
+  id            String   @id @default(cuid())
+  userId        String
+  permissionKey String
+  effect        String // ALLOW | DENY  (deny-by-default RBAC with per-user exceptions)
+  note          String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+
+  @@unique([userId, permissionKey])
+  @@index([userId])
+}
+
+// ----------------------------------------------------------------------------
+// Sessions (server-side, revocable — token stored only as SHA-256 hash)
+// ----------------------------------------------------------------------------
+
+model Session {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  userId    String
+  ip        String?
+  userAgent String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ----------------------------------------------------------------------------
+// Departments (created by Super Admin; drive the dynamic public landing page)
+// ----------------------------------------------------------------------------
+
+model Department {
+  id                 String   @id @default(cuid())
+  name               String
+  description        String?
+  iconKey            String   @default("MessageCircle") // whitelisted lucide icon key
+  displayOrder       Int      @default(0)
+  isActive           Boolean  @default(true)
+  isPublic           Boolean  @default(true)
+  aiEnabled          Boolean  @default(false)
+  welcomeMessage     String?
+  aiSettings         String? // Phase 3: JSON { minConfidence, escalationOffer, fallbackMessage, dailyMessageLimit }
+  ticketSettings     String? // Phase 4: JSON { maxActivePerOperator } — fair-distribution limits
+  storageQuotaBytes  Int? // Phase 5: department file quota (null → global default)
+  operatorQuotaBytes Int? // Phase 5: per-operator quota inside this department (null → global default)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  memberships               DepartmentMembership[]
+  knowledgeCollectionGrants KnowledgeCollectionDepartment[]
+  knowledgeQaAssignments    KnowledgeQaDepartment[]
+  conversations             Conversation[]
+  tickets                   Ticket[]
+  notifications             Notification[]
+  sharedFolders             SharedFolder[]
+  sharedFiles               SharedFile[]
+
+  @@index([isActive, isPublic, displayOrder])
+}
+
+model DepartmentMembership {
+  id           String   @id @default(cuid())
+  userId       String
+  departmentId String
+  isManager    Boolean  @default(false)
+  assignedAt   DateTime @default(now())
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  department Department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, departmentId])
+  @@index([departmentId])
+}
+
+// ----------------------------------------------------------------------------
+// Audit log (every important administrative & security action is auditable)
+// ----------------------------------------------------------------------------
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  actorType   String   @default("USER") // USER | SYSTEM | CUSTOMER
+  actorUserId String?
+  actorLabel  String? // username snapshot (survives user deletion)
+  action      String // e.g. auth.login.success, system.bootstrap.superadmin
+  entityType  String?
+  entityId    String?
+  metadata    String? // JSON-serialized, never contains secrets or raw PII
+  ip          String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([action])
+  @@index([createdAt])
+  @@index([actorUserId])
+}
+
+// ----------------------------------------------------------------------------
+// System settings (key/value JSON store — source of truth for org + AI config)
+// ----------------------------------------------------------------------------
+
+model SystemSetting {
+  key       String   @id // e.g. org.name, ai.global (Phase 3)
+  value     String // JSON-serialized value
+  updatedBy String?
+  updatedAt DateTime @updatedAt
+}
+
+// ============================================================================
+// Phase 3 — Knowledge Base & AI Integration
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Knowledge collections — organizational unit of knowledge; access level and
+// department assignments drive the retrieval scope (KNOWLEDGE-BASE.md section 2)
+// ----------------------------------------------------------------------------
+
+model KnowledgeCollection {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  access      String   @default("DEPARTMENT") // GLOBAL | DEPARTMENT | RESTRICTED
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  departmentGrants KnowledgeCollectionDepartment[]
+  documents        KnowledgeDocument[]
+
+  @@index([access])
+  @@index([isActive])
+}
+
+model KnowledgeCollectionDepartment {
+  collectionId String
+  departmentId String
+  assignedAt   DateTime @default(now())
+
+  collection KnowledgeCollection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  department Department          @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+
+  @@id([collectionId, departmentId])
+  @@index([departmentId])
+}
+
+// ----------------------------------------------------------------------------
+// Documents — uploaded via the storage abstraction (outside web root & DB);
+// status is a first-class, visible state: extraction failures surface, never
+// silently indexed (KNOWLEDGE-BASE.md section 3)
+// ----------------------------------------------------------------------------
+
+model KnowledgeDocument {
+  id               String    @id @default(cuid())
+  collectionId     String
+  title            String
+  originalFilename String
+  mimeType         String
+  sizeBytes        Int
+  checksum         String // SHA-256 of the active version's stored bytes
+  storageKey       String // active version storage reference (storage abstraction key)
+  status           String    @default("UPLOADED") // UPLOADED | PROCESSING | INDEXED | FAILED | DISABLED
+  statusError      String? // visible indexing/extraction error — first-class (spec 5.1)
+  extractedChars   Int?
+  chunkCount       Int?
+  validUntil       DateTime? // optional validity metadata — supersession/conflict reasoning (RAG engine)
+  sourceRef        String? // original source reference (regulation code, external id…)
+  uploadedBy       String
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  collection KnowledgeCollection        @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  versions   KnowledgeDocumentVersion[]
+  chunks     KnowledgeChunk[]
+  uploader   User                       @relation("KbDocumentsUploaded", fields: [uploadedBy], references: [id])
+
+  @@index([collectionId])
+  @@index([status])
+}
+
+model KnowledgeDocumentVersion {
+  id         String   @id @default(cuid())
+  documentId String
+  versionNo  Int
+  storageKey String
+  mimeType   String
+  sizeBytes  Int
+  checksum   String
+  uploadedBy String
+  uploadedAt DateTime @default(now())
+
+  document KnowledgeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  uploader User              @relation("KbVersionsUploaded", fields: [uploadedBy], references: [id])
+  chunks   KnowledgeChunk[]
+
+  @@unique([documentId, versionNo])
+  @@index([documentId])
+}
+
+// ----------------------------------------------------------------------------
+// Chunks — the indexed search unit. The RAG engine (docs/RAG-ENGINE.md) adds
+// structure provenance (headingPath / page), a parent-child relation (SECTION
+// parents expanded for context; PARAGRAPH children for precise matching) and
+// a vector seam (embedding JSON + model/dim versioning — chunks indexed with
+// an incompatible embedding model are never searched with mismatched query
+// vectors; re-embedding goes through the RagJob queue).
+// ----------------------------------------------------------------------------
+
+model KnowledgeChunk {
+  id             String   @id @default(cuid())
+  documentId     String
+  versionId      String
+  ordinal        Int
+  kind           String   @default("PARAGRAPH") // SECTION | PARAGRAPH
+  parentId       String? // SECTION parent of a PARAGRAPH child (self-relation)
+  headingPath    String? // "بخش > زیربخش" — structure provenance for citations
+  page           Int? // page number when the source format provides it
+  text           String // original chunk text (display)
+  normalized     String // normalized text (lexical search index)
+  embedding      String? // JSON number[] — vector index (provider-dependent)
+  embeddingModel String? // embedding model id used for this chunk
+  embeddingDim   Int? // embedding dimension — mismatch ⇒ excluded from vector search
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  document KnowledgeDocument        @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  version  KnowledgeDocumentVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  parent   KnowledgeChunk?          @relation("ChunkParent", fields: [parentId], references: [id], onDelete: Cascade)
+  children KnowledgeChunk[]         @relation("ChunkParent")
+
+  @@unique([versionId, ordinal])
+  @@index([documentId])
+  @@index([isActive])
+  @@index([parentId])
+  @@index([embeddingModel])
+}
+
+// ----------------------------------------------------------------------------
+// Curated Q&A entries — authoritative knowledge; only PUBLISHED entries are
+// retrievable. Q&A matches outrank document chunks in relevance weighting.
+// ----------------------------------------------------------------------------
+
+model KnowledgeQaEntry {
+  id             String   @id @default(cuid())
+  question       String
+  officialAnswer String
+  category       String?
+  keywords       String? // JSON array of strings (SQLite: no native arrays)
+  status         String   @default("DRAFT") // DRAFT | PUBLISHED | DISABLED
+  createdById    String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  createdBy   User                    @relation("KbQaCreated", fields: [createdById], references: [id])
+  alternates  KnowledgeQaAlternate[]
+  departments KnowledgeQaDepartment[]
+
+  @@index([status])
+  @@index([createdById])
+}
+
+model KnowledgeQaAlternate {
+  id       String @id @default(cuid())
+  entryId  String
+  question String
+
+  entry KnowledgeQaEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@index([entryId])
+}
+
+model KnowledgeQaDepartment {
+  entryId      String
+  departmentId String
+
+  entry      KnowledgeQaEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  department Department       @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+
+  @@id([entryId, departmentId])
+  @@index([departmentId])
+}
+
+// ----------------------------------------------------------------------------
+// Retrieval records — every retrieval persisted for audit & quality review;
+// AI answers trace back to these internal source records (spec 5.3)
+// ----------------------------------------------------------------------------
+
+model KnowledgeRetrievalRecord {
+  id             String   @id @default(cuid())
+  conversationId String?
+  departmentId   String?
+  queryDigest    String // SHA-256 of the normalized query (no raw PII in indexes)
+  queryText      String // internal audit copy of the customer question
+  decision       String // ANSWERED | ABSTAINED_NO_EVIDENCE | ABSTAINED_LOW_SCORE | ABSTAINED_LIMIT | ABSTAINED_PROVIDER | ABSTAINED_DISABLED
+  topScore       Float?
+  sources        String? // JSON array of { kind, refId, title, score }
+  createdAt      DateTime @default(now())
+
+  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+
+  @@index([conversationId])
+  @@index([decision])
+  @@index([createdAt])
+}
+
+// ----------------------------------------------------------------------------
+// Conversations — Phase 3 minimal surface (AI assistant + human escalation).
+// One continuous conversation across mode transitions (AI-ARCHITECTURE section 4).
+// Phase 4 extends with customer identity, tickets and fair distribution.
+// ----------------------------------------------------------------------------
+
+model Conversation {
+  id            String   @id @default(cuid())
+  departmentId  String
+  customerToken String   @unique // random resume token stored client-side (never an internal id exposure)
+  customerName  String?
+  mode          String   @default("AI_ASSISTED") // AI_ASSISTED | WAITING_FOR_OPERATOR | ASSIGNED_TO_OPERATOR | HUMAN_ACTIVE | RESOLVED
+  assignedToId  String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  lastMessageAt DateTime @default(now())
+
+  customerId String?
+  department Department                 @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  assignedTo User?                      @relation("ConversationsAssigned", fields: [assignedToId], references: [id])
+  customer   CustomerProfile?           @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  messages   ConversationMessage[]
+  retrievals KnowledgeRetrievalRecord[]
+  usageLogs  AiUsageLog[]
+  tickets    Ticket[]
+
+  @@index([departmentId])
+  @@index([mode])
+  @@index([customerToken])
+  @@index([lastMessageAt])
+}
+
+model ConversationMessage {
+  id             String   @id @default(cuid())
+  conversationId String
+  role           String // CUSTOMER | ASSISTANT | OPERATOR | SYSTEM
+  content        String
+  sourcesCount   Int? // assistant messages only: grounded source count (no internal metadata)
+  createdAt      DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+}
+
+// ----------------------------------------------------------------------------
+// AI usage logs — observability per AI-ARCHITECTURE section 9 (ai.usage.view)
+// ----------------------------------------------------------------------------
+
+model AiUsageLog {
+  id               String   @id @default(cuid())
+  conversationId   String?
+  departmentId     String?
+  provider         String
+  model            String
+  promptTokens     Int      @default(0)
+  completionTokens Int      @default(0)
+  latencyMs        Int      @default(0)
+  outcome          String // ANSWERED | ABSTAINED | HANDOFF | ERROR
+  createdAt        DateTime @default(now())
+
+  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+
+  @@index([departmentId])
+  @@index([outcome])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// RAG engine (docs/RAG-ENGINE.md) — background jobs, deep retrieval traces
+// and evaluation runs.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// RagJob — DB-backed job queue for long-running document operations. One
+// in-process runner claims PENDING jobs (single SQLite connection ⇒ simple
+// claim), retries with backoff, and records explicit failures. Document
+// content never lives here — only references + parameters.
+// ----------------------------------------------------------------------------
+
+model RagJob {
+  id          String    @id @default(cuid())
+  type        String // INGEST_DOCUMENT | REINDEX_DOCUMENT | REEMBED_SCOPE | DELETE_INDEX
+  status      String    @default("PENDING") // PENDING | RUNNING | SUCCEEDED | FAILED
+  payload     String    @default("{}") // JSON — job parameters (documentId, scope…)
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(3)
+  lastError   String?
+  runAfter    DateTime  @default(now()) // backoff gate
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, runAfter])
+  @@index([type])
+  @@index([createdAt])
+}
+
+// ----------------------------------------------------------------------------
+// RagTrace — full per-turn retrieval trace: strategy, every iteration's
+// decision and corrective action, final outcome, budgets consumed. Powers the
+// admin trace viewer and the evaluation diagnostics. Evidence citations here
+// are internal (operator/admin only) — never sent to customers.
+// ----------------------------------------------------------------------------
+
+model RagTrace {
+  id                 String   @id @default(cuid())
+  conversationId     String?
+  departmentId       String?
+  query              String // original customer question
+  strategy           String // FAST_QA | LEXICAL | SEMANTIC | HYBRID | MULTI_QUERY | DECOMPOSE
+  decision           String // ANSWERED | CLARIFY | ABSTAIN | ESCALATE
+  iterations         Int      @default(0)
+  llmCalls           Int      @default(0)
+  durationMs         Int      @default(0)
+  finalConfidence    Float?
+  correctiveActions  String? // JSON array of { round, action, detail, result }
+  evidence           String? // JSON array of internal evidence refs used for the answer
+  citations          String? // JSON array of customer-safe citations (title + page/section)
+  conflictDetected   Boolean  @default(false)
+  supersededExcluded Boolean  @default(false)
+  embeddingModel     String?
+  budgetExceeded     Boolean  @default(false)
+  createdAt          DateTime @default(now())
+
+  @@index([conversationId])
+  @@index([departmentId])
+  @@index([decision])
+  @@index([createdAt])
+}
+
+// ----------------------------------------------------------------------------
+// RagEvalRun — one reproducible evaluation execution over the acceptance
+// dataset (or a custom one): aggregate metrics + per-case results JSON.
+// ----------------------------------------------------------------------------
+
+model RagEvalRun {
+  id            String   @id @default(cuid())
+  datasetId     String // e.g. "acceptance-v1"
+  engineVersion String // VERSION at run time
+  total         Int
+  passed        Int
+  failed        Int
+  metricsJson   String // aggregate retrieval + answer metrics
+  resultsJson   String // per-case results (queries, metrics, failures)
+  durationMs    Int      @default(0)
+  createdAt     DateTime @default(now())
+
+  @@index([datasetId])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// Phase 4 — Customer Portal & Ticketing
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Customer profiles (کاربران سامانه) — Phase 8 password-based accounts.
+// The national ID is NEVER a relational key: stored app-level AES-256-GCM
+// encrypted (enc.v1) with a keyed-HMAC-SHA256 equality index for lookups;
+// never exposed in URLs/logs/APIs/operator lists (DATABASE.md section 6,
+// SECURITY.md section 4). One profile can hold tickets across departments.
+// Citizens authenticate with national ID + password (set at first contact);
+// OTP/SMS verification was removed in Phase 8 (user decision).
+// ----------------------------------------------------------------------------
+
+model CustomerProfile {
+  id                 String    @id @default(cuid())
+  fullName           String
+  nationalIdEnc      String // enc.v1 ciphertext (never displayed in full)
+  nationalIdHmac     String    @unique // keyed HMAC-SHA256 hex — equality lookup only
+  phone              String?
+  passwordHash       String? // bcrypt; null only for legacy rows created before Phase 8 (set on next contact)
+  status             String    @default("ACTIVE") // ACTIVE | BLOCKED (superadmin manage)
+  mustChangePassword Boolean   @default(false) // true right after a superadmin reset (informational in portal)
+  lastLoginAt        DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  tickets       Ticket[]
+  conversations Conversation[]
+  notifications Notification[]
+
+  @@index([fullName])
+  @@index([status])
+}
+
+// ----------------------------------------------------------------------------
+// Tickets — status machine: OPEN → IN_PROGRESS ⇄ WAITING_CUSTOMER → RESOLVED
+// → CLOSED (reopen from RESOLVED/CLOSED by message). `number` is a
+// human-friendly sequential identifier assigned in the creation transaction.
+// ----------------------------------------------------------------------------
+
+model Ticket {
+  id              String    @id @default(cuid())
+  number          Int       @unique
+  departmentId    String
+  customerId      String? // nullable: CHAT_HANDOFF tickets from anonymous chats
+  subject         String
+  status          String    @default("OPEN") // OPEN | IN_PROGRESS | WAITING_CUSTOMER | RESOLVED | CLOSED
+  assignedToId    String?
+  assignedAt      DateTime?
+  assignmentMode  String? // AUTO_FAIR | MANUAL | TRANSFER | SELF
+  firstResponseAt DateTime?
+  resolvedAt      DateTime?
+  closedAt        DateTime?
+  conversationId  String? // linked live chat conversation (CHAT_HANDOFF)
+  createdVia      String    @default("PORTAL") // PORTAL | OPERATOR_INTERNAL | CHAT_HANDOFF
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  customer      CustomerProfile?      @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  department    Department            @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  assignedTo    User?                 @relation("TicketsAssigned", fields: [assignedToId], references: [id])
+  conversation  Conversation?         @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  messages      TicketMessage[]
+  statusHistory TicketStatusHistory[]
+  notifications Notification[]
+
+  @@index([departmentId, status])
+  @@index([customerId])
+  @@index([assignedToId, status])
+  @@index([status, createdAt])
+  @@index([conversationId])
+}
+
+// ----------------------------------------------------------------------------
+// Ticket messages — CUSTOMER / OPERATOR / SYSTEM entries; OPERATOR messages
+// flagged isInternalNote are NEVER exposed to customers (server-filtered).
+// ----------------------------------------------------------------------------
+
+model TicketMessage {
+  id             String   @id @default(cuid())
+  ticketId       String
+  authorType     String // CUSTOMER | OPERATOR | SYSTEM
+  authorId       String? // staff user id (OPERATOR only)
+  authorLabel    String? // display snapshot (survives user deletion)
+  content        String
+  isInternalNote Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  ticket      Ticket             @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author      User?              @relation("TicketMessagesAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+  attachments TicketAttachment[]
+
+  @@index([ticketId, createdAt])
+  @@index([authorId])
+}
+
+// ----------------------------------------------------------------------------
+// Attachments — stored via the storage abstraction OUTSIDE the web root & DB
+// with randomized server-side identifiers; downloads only through authorized
+// endpoints that re-check ownership/scope per request.
+// ----------------------------------------------------------------------------
+
+model TicketAttachment {
+  id         String   @id @default(cuid())
+  messageId  String
+  filename   String // original client filename (display only)
+  storageKey String // randomized key inside the storage root
+  mimeType   String // verified content type (magic bytes)
+  sizeBytes  Int
+  checksum   String // SHA-256
+  createdAt  DateTime @default(now())
+
+  message TicketMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+}
+
+// ----------------------------------------------------------------------------
+// Ticket status history — append-only audit trail of every transition
+// ----------------------------------------------------------------------------
+
+model TicketStatusHistory {
+  id         String   @id @default(cuid())
+  ticketId   String
+  fromStatus String?
+  toStatus   String
+  actorType  String // CUSTOMER | OPERATOR | SYSTEM
+  actorId    String?
+  actorLabel String?
+  note       String?
+  createdAt  DateTime @default(now())
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId, createdAt])
+}
+
+// ----------------------------------------------------------------------------
+// Notifications — in-app notifications for operators (bell) and customers
+// (portal); SMS/outbound delivery is a documented Phase-4 seam (provider=none).
+// ----------------------------------------------------------------------------
+
+model Notification {
+  id                  String    @id @default(cuid())
+  recipientType       String // OPERATOR | CUSTOMER
+  recipientUserId     String? // operator recipient
+  recipientCustomerId String? // customer recipient
+  departmentId        String?
+  ticketId            String?
+  conversationId      String?
+  kind                String // TICKET_ASSIGNED | TICKET_CUSTOMER_REPLY | TICKET_TRANSFERRED | TICKET_STATUS_CHANGED | TICKET_UNASSIGNED_QUEUE | TICKET_OPERATOR_REPLY
+  title               String
+  body                String?
+  readAt              DateTime?
+  createdAt           DateTime  @default(now())
+
+  recipientUser     User?            @relation("NotificationsUser", fields: [recipientUserId], references: [id], onDelete: Cascade)
+  recipientCustomer CustomerProfile? @relation(fields: [recipientCustomerId], references: [id], onDelete: Cascade)
+  ticket            Ticket?          @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  department        Department?      @relation(fields: [departmentId], references: [id])
+
+  @@index([recipientUserId, readAt, createdAt])
+  @@index([recipientCustomerId, readAt, createdAt])
+}
+
+// ============================================================================
+// Phase 5 — Shared File Hub
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Shared folders — nested (self-relation) per department. A folder belongs to
+// exactly one department; moving across departments is intentionally NOT
+// supported (cross-department restrictions are server-enforced).
+// ----------------------------------------------------------------------------
+
+model SharedFolder {
+  id           String   @id @default(cuid())
+  departmentId String
+  parentId     String? // null = department root level
+  name         String // validated display name (no path separators)
+  createdById  String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  department Department     @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  parent     SharedFolder?  @relation("FolderTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children   SharedFolder[] @relation("FolderTree")
+  files      SharedFile[]
+  creator    User           @relation("SharedFoldersCreated", fields: [createdById], references: [id])
+
+  @@index([departmentId, parentId])
+  @@index([createdById])
+}
+
+// ----------------------------------------------------------------------------
+// Shared files — bytes live OUTSIDE the web root and DB under
+// `<STORAGE_DIR>/shared/` with randomized server-side keys (spec §8/§10);
+// mimeType is content-verified (magic bytes); downloads only through
+// authorized endpoints that re-check department scope per request.
+// ----------------------------------------------------------------------------
+
+model SharedFile {
+  id           String   @id @default(cuid())
+  departmentId String
+  folderId     String? // null = department root level
+  name         String // display name (unique per folder, service-enforced)
+  storageKey   String // randomized key inside the storage root
+  mimeType     String // verified content type (magic bytes)
+  sizeBytes    Int
+  checksum     String // SHA-256 of current content
+  version      Int      @default(1) // bumped on every replace
+  scanStatus   String   @default("SKIPPED") // SKIPPED | CLEAN (infected/failed uploads are rejected before storage)
+  uploadedById String // last uploader (operator quota accounting)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  department Department    @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  folder     SharedFolder? @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  uploader   User          @relation("SharedFilesUploaded", fields: [uploadedById], references: [id])
+
+  @@unique([departmentId, folderId, name])
+  @@index([departmentId, folderId])
+  @@index([uploadedById])
+}

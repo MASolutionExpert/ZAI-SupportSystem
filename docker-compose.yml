@@ -1,0 +1,60 @@
+# =============================================================================
+# Support Desk — production Docker Compose
+#
+# DESIGN DECISION — no database service (single-node, self-hosted):
+#   * Phase 1 uses SQLite, stored on the named volume `supportdesk_db` mounted
+#     at /app/db (DATABASE_URL=file:/app/db/supportdesk.db). There is NO
+#     separate PostgreSQL service; the Prisma schema is provider-portable to
+#     PostgreSQL in a later phase without model changes — see DATABASE.md.
+#   * Uploaded/persistent files live on the named volume `supportdesk_storage`
+#     mounted at /app/storage (STORAGE_DIR=/app/storage).
+#
+# IMAGE — pin an explicit version, NEVER :latest in production:
+#   Set in .env:  SUPPORTDESK_IMAGE=ghcr.io/<org>/<repo>:0.1.0
+#   The registry/mirror is configurable at deploy time via SUPPORTDESK_IMAGE.
+#   For a local build instead of a registry pull, uncomment the `build:` block
+#   below and run `docker compose build`.
+#
+# HOST PORT:
+#   Set APP_PORT in .env to change the published host port (the container
+#   itself always listens on 3000). Default: 3000.
+#
+# HTTPS / reverse proxy (Caddy overlay):
+#   docker compose -f docker-compose.yml -f deploy/caddy/docker-compose.caddy.yml up -d
+# =============================================================================
+
+services:
+  app:
+    image: ${SUPPORTDESK_IMAGE:-supportdesk:0.1.0}
+    # Local build alternative (instead of pulling from a registry):
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    container_name: supportdesk-app
+    env_file: .env
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    volumes:
+      - supportdesk_db:/app/db
+      - supportdesk_storage:/app/storage
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+# Persistent data volumes — survive rebuilds, upgrades and restarts.
+# They are pre-created inside the image as uid-1000 (user "node") directories,
+# so first use inherits safe ownership.
+volumes:
+  supportdesk_db:
+  supportdesk_storage:

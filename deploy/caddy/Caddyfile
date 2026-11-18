@@ -1,0 +1,39 @@
+# =============================================================================
+# Support Desk — example reverse proxy (Caddy 2, automatic HTTPS)
+#
+# USAGE (run from the deployment folder that contains docker-compose.yml):
+#
+#     docker compose -f docker-compose.yml -f deploy/caddy/docker-compose.caddy.yml up -d
+#
+# BEFORE STARTING:
+#   1. Point the DNS A record of your domain at this server.
+#   2. Replace `support.example.com` below with your real domain.
+#   3. Make sure ports 80 and 443 are reachable from the internet (Caddy
+#      answers the ACME/Let's Encrypt challenge on them).
+#   4. Optional: add `email you@example.com` inside the site block to receive
+#      certificate-expiry notices from Let's Encrypt.
+#
+# Caddy terminates TLS and proxies to the `app` service over the shared
+# compose network. The app trusts the standard `x-forwarded-proto` header
+# (FORCE_SECURE_COOKIES can stay empty — it auto-detects HTTPS).
+# =============================================================================
+
+support.example.com {
+	# Next.js app container (service name on the shared compose network).
+	reverse_proxy app:3000
+
+	# Request body limit — raise/lower to match your Shared File Hub policy.
+	request_body {
+		max_size 100MB
+	}
+
+	encode gzip
+
+	# Minimal security headers.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}
