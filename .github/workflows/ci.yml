@@ -148,6 +148,9 @@ jobs:
           tail -100 dev-ci.log || true
           exit 1
 
+      - name: Seed demo baseline (departments, KB, operators)
+        run: bun scripts/seed-demo.ts
+
       - name: Phase 4 — concurrent ticket creation & fair distribution
         run: bun --conditions=react-server scripts/test-phase4-concurrency.ts
 
