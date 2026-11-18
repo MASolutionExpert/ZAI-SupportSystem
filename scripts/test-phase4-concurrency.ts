@@ -136,6 +136,8 @@ async function main() {
   // event loop alive after the work is done).
   await (await import("@/lib/cache")).shutdownCache();
   if (!det || unique.size !== ok.length) process.exitCode = 1;
+  // Verification script: force-exit so no lingering handle can hang CI.
+  process.exit(process.exitCode ?? 0);
 }
 
 main().catch(async (error) => {

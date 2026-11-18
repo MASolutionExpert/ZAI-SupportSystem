@@ -256,11 +256,13 @@ export function getCacheStatus(): {
   };
 }
 
-/** Close the Redis connection (tests / graceful shutdown). */
+/** Close the Redis connection (tests / graceful shutdown). Never hangs:
+ * disconnect() force-closes the socket synchronously instead of negotiating
+ * QUIT over a possibly half-open connection. */
 export async function shutdownCache(): Promise<void> {
   if (redis) {
     try {
-      await redis.quit();
+      redis.disconnect();
     } catch {
       // ignore
     }

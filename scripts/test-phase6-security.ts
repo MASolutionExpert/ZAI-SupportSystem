@@ -402,7 +402,8 @@ main()
   })
   .finally(async () => {
     await db.$disconnect();
-    // Close the cache tier explicitly (an open Redis socket would keep the
-    // event loop alive after the work is done).
+    // Close the cache tier explicitly, then force-exit: verification scripts
+    // must never hang CI because of a lingering handle.
     await (await import("@/lib/cache")).shutdownCache();
+    process.exit(0);
   });
