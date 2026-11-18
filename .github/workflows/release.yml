@@ -21,8 +21,8 @@ on:
       - "v*"
 
 permissions:
-  contents: read
-  packages: write
+  contents: write   # create the GitHub Release entry
+  packages: write   # publish the container image
 
 env:
   REGISTRY: ghcr.io
@@ -83,6 +83,15 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Support Desk v${{ steps.version.outputs.version }}" \
+            --generate-notes \
+            --verify-tag
 
       - name: Job summary
         run: |
