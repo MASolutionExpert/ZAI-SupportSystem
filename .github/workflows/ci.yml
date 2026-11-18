@@ -60,6 +60,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Generate Prisma client
+        run: bunx prisma generate
+
       - name: Typecheck
         run: bun run typecheck
 
@@ -146,16 +149,16 @@ jobs:
           exit 1
 
       - name: Phase 4 — concurrent ticket creation & fair distribution
-        run: bun scripts/test-phase4-concurrency.ts
+        run: bun --conditions=react-server scripts/test-phase4-concurrency.ts
 
       - name: Phase 5 — file hub fail-closed security
-        run: bun scripts/test-phase5-security.ts
+        run: bun --conditions=react-server scripts/test-phase5-security.ts
 
       - name: Phase 6 — admin permission matrix & audit trail
-        run: bun scripts/test-phase6-security.ts
+        run: bun --conditions=react-server scripts/test-phase6-security.ts
 
       - name: Phase 7 — production hardening suite
-        run: bun scripts/test-phase7-hardening.ts
+        run: bun --conditions=react-server scripts/test-phase7-hardening.ts
 
       - name: Dump dev server log (on failure)
         if: failure()
