@@ -78,7 +78,7 @@ RUN bunx prisma generate
 # -----------------------------------------------------------------------------
 # Stage 4 — runtime: minimal Node 22 server, non-root
 # -----------------------------------------------------------------------------
-FROM node:22-bookworm-slim AS runtime
+FROM node:25-bookworm-slim AS runtime
 
 # openssl is required by Prisma; tini gives us correct PID-1 signal handling
 # and zombie reaping. Nothing else is installed.
